@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/myterm.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>myterm-波哥自研</title>
+    <style>
+      /* 启动期背景色：WebView2 加载 CSS 之前先显示主题底色（--bg: #0e1116），避免白色闪烁 */
+      html,
+      body {
+        background-color: #0e1116;
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,29 @@
+[package]
+name = "myterm"
+version = "1.0.41"
+description = "MyTerm - 跨平台远程 SSH 终端工具，集成 SFTP 文件管理与系统资源监控"
+authors = ["MyTerm"]
+edition = "2021"
+
+[lib]
+name = "myterm_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2"
+ssh-key = "=0.7.0-rc.11"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+base64 = "0.22"
+bytes = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "default-tls"] }

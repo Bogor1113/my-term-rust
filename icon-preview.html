@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<title>MyTerm 图标预览</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #11151d; color: #c8d2e0; padding: 40px; }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 8px; color: #e8eef8; }
+  .sub { font-size: 13px; color: #7a8698; margin-bottom: 32px; }
+  .row { display: flex; gap: 36px; flex-wrap: wrap; margin-bottom: 40px; align-items: flex-start; }
+  .group { display: flex; flex-direction: column; gap: 12px; }
+  .group-title { font-size: 13px; color: #8b96a8; margin-bottom: 4px; }
+  .cell { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .cell span { font-size: 11px; color: #6d788a; font-family: Consolas, monospace; }
+  .chip { border-radius: 16%; overflow: hidden; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  .on-dark { background: #14181f; padding: 14px; border-radius: 18px; }
+  .on-light { background: #f2f4f8; padding: 14px; border-radius: 18px; }
+  .big { display: flex; align-items: center; justify-content: center; padding: 28px; border-radius: 24px; }
+  .note { font-size: 12px; line-height: 1.8; color: #7a8698; max-width: 560px; }
+  .note b { color: #aebacb; }
+</style>
+</head>
+<body>
+  <h1>MyTerm 应用图标预览</h1>
+  <div class="sub">深海军蓝圆角方块 · 蓝青渐变发光提示符 · 白色光标块 · 绿色状态点</div>
+
+  <div class="row">
+    <div class="group">
+      <div class="group-title">大尺寸</div>
+      <div class="cell">
+        <div class="big on-dark" style="background:#14181f">
+          <img src="app-icon.png" width="180" height="180" class="chip" />
+        </div>
+        <span>1024×1024 源图</span>
+      </div>
+      <div class="cell">
+        <div class="big" style="background:#eef1f6">
+          <img src="app-icon.png" width="180" height="180" class="chip" />
+        </div>
+        <span>浅色背景</span>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="group-title">Windows 实际使用尺寸</div>
+      <div class="cell">
+        <div class="on-dark"><img src="src-tauri/icons/256x256.png" width="128" height="128" class="chip" /></div>
+        <span>256x256.png</span>
+      </div>
+      <div class="cell">
+        <div class="on-dark"><img src="src-tauri/icons/128x128.png" width="128" height="128" class="chip" /></div>
+        <span>128x128.png（任务栏）</span>
+      </div>
+      <div class="cell">
+        <div class="on-dark"><img src="src-tauri/icons/64x64.png" width="64" height="64" class="chip" /></div>
+        <span>64x64.png</span>
+      </div>
+      <div class="cell">
+        <div class="on-dark"><img src="src-tauri/icons/32x32.png" width="32" height="32" class="chip" /></div>
+        <span>32x32.png</span>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="group-title">桌面/文件管理器</div>
+      <div class="cell">
+        <div class="on-light"><img src="src-tauri/icons/icon.png" width="128" height="128" class="chip" /></div>
+        <span>icon.png（桌面图标）</span>
+      </div>
+      <div class="cell">
+        <div class="on-dark"><img src="src-tauri/icons/icon.png" width="48" height="48" class="chip" /></div>
+        <span>48px 小尺寸</span>
+      </div>
+      <div class="cell">
+        <div class="on-dark" style="padding:8px"><img src="src-tauri/icons/icon.png" width="24" height="24" class="chip" /></div>
+        <span>24px 最小尺寸</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>设计说明：</b>深色终端风格与界面整体一致 —— 右下角绿色圆点代表「连接正常」，<b>❯</b> 提示符 + 光标块呼应 SSH 终端，蓝青色发光是界面主题色。
+    图标已由 <code>npx tauri icon</code> 生成全部平台规格（.ico / .icns / 各尺寸 png）。
+  </div>
+</body>
+</html>

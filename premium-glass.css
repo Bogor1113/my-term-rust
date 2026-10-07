@@ -1,0 +1,384 @@
+/* ============================================================================
+ * premium-glass.css —— 波哥质感主题（可移植独立版）
+ * ============================================================================
+ * 设计目标：给任意 Web / Tauri / Electron 项目套上一套"科技感玻璃"主题。
+ *
+ * 四层系统（理解它，改起来就随心所欲）：
+ *   ① body::before  背景氛围层 —— 多层彩色光晕 + 细网格线 + 呼吸动画
+ *   ② body::after   全屏噪点层  —— feTurbulence 颗粒，模拟磨砂玻璃
+ *   ③ .pg-* 面板    半透明玻璃  —— blur + saturate + 内高光 + 噪点
+ *   ④ 交互辉光      hover/激活 —— accent 光晕 + brightness
+ *
+ * 使用：
+ *   1. <link rel="stylesheet" href="premium-glass.css"> 或在入口 import
+ *   2. 面板使用 <div class="pg-panel">、弹窗用 pg-popup、标题栏按下方注释接入
+ *   3. 只改 :root 里的 --pg-accent，整套配色自动派生
+ *   4. 全名变量前缀 pg = premium glass，与既有项目零冲突
+ *
+ * 性能红线（实测）：
+ *   - blur 16~20px，别超 22px
+ *   - saturate ≤ 1.35
+ *   - 噪点 tile 120px，全屏噪点 opacity ≤ 0.6，弹层 ≤ 0.5
+ *   - 呼吸动画 8s、幅度 ±0.15（幅度太大会让所有玻璃面板每帧重采样模糊）
+ * ========================================================================== */
+
+:root {
+  /* ---------- 主色系：改这一个，全主题跟着变 ---------- */
+  --pg-accent: #4f8cff;                    /* 主强调色，光晕/描边都从它派生 */
+  --pg-accent-hover: #7ab0ff;              /* hover 更亮一档 */
+  --pg-accent-2: #b58cff;                  /* 渐变第二色（紫） */
+  --pg-accent-grad: linear-gradient(135deg, var(--pg-accent) 0%, var(--pg-accent-2) 100%);
+
+  /* ---------- 背景三档 ---------- */
+  --pg-bg: #0e1116;        /* 最底层底色 */
+  --pg-bg-elev: #141921;   /* 比背景亮一档（弹窗渐变底） */
+  --pg-bg-panel: #12161d;
+
+  /* ---------- 玻璃面板 ---------- */
+  --pg-glass: rgba(17, 22, 30, 0.5);          /* 面板（侧栏/标签栏/工具栏） */
+  --pg-glass-strong: rgba(14, 18, 25, 0.76);  /* 强玻璃（弹窗/菜单，压得住复杂背景） */
+  --pg-glass-blur: 16px;
+  --pg-glass-saturate: 1.25;
+  --pg-glass-highlight: linear-gradient(180deg, rgba(255, 255, 255, 0.09) 0%, transparent 50%);
+
+  /* ---------- 磨砂噪点（SVG feTurbulence 内联，含 4 octave 分形噪点） ---------- */
+  --pg-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+
+  /* ---------- 辉光家族 ---------- */
+  --pg-accent-glow: 0 6px 22px rgba(79, 140, 255, 0.35);   /* 图标/按钮辉光 */
+  --pg-edge-glow: rgba(79, 140, 255, 0.55);                /* 描边辉光色值 */
+  --pg-inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.07), inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+
+  /* ---------- 交互 ---------- */
+  --pg-hover-tint: rgba(79, 140, 255, 0.1);    /* hover 背景 */
+  --pg-hover-border: rgba(79, 140, 255, 0.3);  /* hover 描边 */
+
+  /* ---------- 阴影 ---------- */
+  --pg-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --pg-shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --pg-shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.55);
+}
+
+/* ============================================================================
+ * ① 背景氛围层 body::before
+ * 五团径向光晕（左上蓝 → 右上紫 → 底部青 → 右下/中部辅助光）+ 双密度网格线。
+ * 加 .pg-bg-static 到 <html> 可关闭呼吸动画（静态模式）。
+ * ========================================================================== */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(1200px 560px at 10% -15%, rgba(79, 140, 255, 0.30), transparent 55%),
+    radial-gradient(900px 480px at 105% 4%, rgba(122, 92, 255, 0.22), transparent 50%),
+    radial-gradient(1100px 650px at 50% 120%, rgba(56, 193, 219, 0.14), transparent 55%),
+    radial-gradient(700px 400px at 80% 90%, rgba(79, 140, 255, 0.12), transparent 50%),
+    radial-gradient(600px 350px at 25% 70%, rgba(122, 92, 255, 0.09), transparent 50%),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 14px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 14px),
+    var(--pg-bg);
+  animation: pg-breathe 8s ease-in-out infinite;
+}
+
+/* ============================================================================
+ * ② 全屏噪点层 body::after
+ * 亮色主题请把 mix-blend-mode 换成 multiply、opacity 降到 0.45。
+ * ========================================================================== */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--pg-noise);
+  background-size: 120px 120px;
+  opacity: 0.6;
+  mix-blend-mode: overlay;
+}
+
+/* ============================================================================
+ * ③ 玻璃面板基础类
+ * ========================================================================== */
+
+/* 半透明玻璃层（侧栏 / 标签栏 / 工具栏 / 卡片） */
+.pg-panel {
+  position: relative;
+  background:
+    var(--pg-noise),
+    linear-gradient(180deg, rgba(79, 140, 255, 0.07), transparent 90px),
+    var(--pg-glass);
+  background-size: 120px 120px, auto, auto;
+  backdrop-filter: blur(var(--pg-glass-blur)) saturate(var(--pg-glass-saturate));
+  -webkit-backdrop-filter: blur(var(--pg-glass-blur)) saturate(var(--pg-glass-saturate));
+  box-shadow: var(--pg-shadow-sm), var(--pg-inner-glow);
+}
+
+/* 顶部 1px 高光边：让玻璃"有形"的关键一笔 */
+.pg-panel::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 14%;
+  right: 14%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.16), transparent);
+  pointer-events: none;
+}
+
+/* 底部 accent 描边（把玻璃吊在版面里的那根彩线） */
+.pg-accent-line {
+  border-top: 1px solid rgba(79, 140, 255, 0.55);
+  box-shadow: 0 -1px 8px -2px rgba(79, 140, 255, 0.5);
+}
+.pg-accent-line::after {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(79, 140, 255, 0.55), transparent);
+}
+
+/* 强玻璃弹层 / 菜单 / 对话框 */
+.pg-popup {
+  position: relative;
+  overflow: hidden;
+  background:
+    var(--pg-noise),
+    linear-gradient(180deg, var(--pg-glass-strong), var(--pg-bg-elev) 70%);
+  background-size: 120px 120px, auto;
+  backdrop-filter: blur(calc(var(--pg-glass-blur) + 4px)) saturate(var(--pg-glass-saturate));
+  -webkit-backdrop-filter: blur(calc(var(--pg-glass-blur) + 4px)) saturate(var(--pg-glass-saturate));
+  border: 1px solid rgba(79, 140, 255, 0.16);
+  border-radius: 14px;
+  box-shadow:
+    var(--pg-shadow-lg),
+    0 0 46px -18px var(--pg-edge-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  animation: pg-pop 0.16s ease-out;
+}
+.pg-popup::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--pg-noise);
+  background-size: 120px 120px;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* 弹出动画（键盘菜单等） */
+.pg-pop {
+  position: relative;
+  background: var(--pg-glass-strong);
+  backdrop-filter: blur(calc(var(--pg-glass-blur) + 2px)) saturate(var(--pg-glass-saturate));
+  -webkit-backdrop-filter: blur(calc(var(--pg-glass-blur) + 2px)) saturate(var(--pg-glass-saturate));
+  border: 1px solid var(--pg-hover-border);
+  border-radius: 9px;
+  box-shadow:
+    var(--pg-shadow-lg),
+    0 0 28px -12px var(--pg-edge-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  animation: pg-pop 0.1s ease-out;
+}
+.pg-pop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--pg-noise);
+  background-size: 120px 120px;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* 渐变标题文字（logo / 标题） */
+.pg-grad-text {
+  background: var(--pg-accent-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* 卡片衬光：卡片顶部一片受光，配合玻璃更像真实材质 */
+.pg-card-shine {
+  background: var(--pg-glass-highlight);
+}
+
+/* ============================================================================
+ * ④ 交互辉光
+ * ========================================================================== */
+.pg-btn-icon,
+.pg-btn {
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s, filter 0.15s;
+}
+.pg-btn-icon:hover,
+.pg-btn:hover {
+  background: var(--pg-hover-tint);
+  color: var(--pg-accent);
+  box-shadow: 0 0 10px -4px var(--pg-edge-glow);
+  filter: brightness(1.12);
+}
+.pg-active {
+  box-shadow: 0 0 10px -3px var(--pg-accent-glow);
+}
+
+/* ============================================================================
+ * 自绘标题栏（Tauri 关 decorations 后的玻璃标题栏；纯 web 可忽略）
+ * 组件结构：
+ *   <div class="pg-titlebar">
+ *     <div class="pg-titlebar-drag" data-tauri-drag-region>
+ *       <img class="pg-titlebar-logo" src="logo.svg" />
+ *       <span class="pg-titlebar-title">App</span>  → 加 pg-grad-text
+ *       <span class="pg-titlebar-sub">标语</span>
+ *     </div>
+ *     <div class="pg-titlebar-controls">
+ *       <button class="pg-titlebar-btn" onclick="win.minimize()">一</button>
+ *       <button class="pg-titlebar-btn" onclick="win.toggleMaximize()">□</button>
+ *       <button class="pg-titlebar-btn close" onclick="win.close()">×</button>
+ *     </div>
+ *   </div>
+ * 需要权限（Tauri capabilities/default.json）：
+ *   core:window:allow-start-dragging / allow-minimize / allow-toggle-maximize
+ *   core:window:allow-is-maximized / allow-close
+ * ========================================================================== */
+.pg-titlebar {
+  height: 36px;
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  position: relative;
+  overflow: hidden;
+  background:
+    var(--pg-noise),
+    radial-gradient(120% 280% at 4% -30%, rgba(79, 140, 255, 0.32), transparent 55%),
+    radial-gradient(90% 240% at 96% -40%, rgba(122, 92, 255, 0.24), transparent 55%),
+    radial-gradient(70% 200% at 50% -60%, rgba(56, 193, 219, 0.1), transparent 60%),
+    linear-gradient(180deg, var(--pg-glass-strong), var(--pg-glass) 80%);
+  background-size: 120px 120px, auto, auto, auto, auto;
+  backdrop-filter: blur(calc(var(--pg-glass-blur) + 4px)) saturate(var(--pg-glass-saturate));
+  -webkit-backdrop-filter: blur(calc(var(--pg-glass-blur) + 4px)) saturate(var(--pg-glass-saturate));
+  border-bottom: 1px solid rgba(79, 140, 255, 0.14);
+  box-shadow:
+    var(--pg-shadow-sm),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.28);
+  user-select: none;
+  cursor: default;
+}
+.pg-titlebar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 4%, rgba(255, 255, 255, 0.22) 50%, transparent 96%);
+  pointer-events: none;
+}
+.pg-titlebar-drag {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+}
+.pg-titlebar-logo {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  filter: drop-shadow(0 0 6px rgba(79, 140, 255, 0.45));
+}
+.pg-titlebar-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+}
+.pg-titlebar-sub {
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  color: #5d6572;
+}
+.pg-titlebar-controls {
+  display: flex;
+  align-items: stretch;
+  flex: none;
+}
+.pg-titlebar-btn {
+  width: 44px;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: #8b93a0;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.pg-titlebar-btn:hover { background: var(--pg-hover-tint); color: #d7dbe2; }
+.pg-titlebar-btn:active { background: rgba(30, 37, 48, 1); }
+.pg-titlebar-btn.close:hover { background: #f85149; color: #ffffff; }
+
+/* ============================================================================
+ * 动画 keyframes
+ * ========================================================================== */
+@keyframes pg-breathe {
+  0%, 100% { opacity: 0.85; }
+  50%      { opacity: 1; }
+}
+@keyframes pg-pop {
+  from { opacity: 0; transform: scale(0.97) translateY(2px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes pg-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ============================================================================
+ * 无障碍：系统开启"减少动态效果"时关闭动画
+ * ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none; }
+  .pg-pop, .pg-popup, .pg-pop { animation-duration: 0.01s; }
+}
+
+/* ============================================================================
+ * 亮色主题用法（可选）
+ * 在亮色容器上加 .pg-light，即可覆盖整套配色为浅色玻璃：
+ *   <html class="pg-light">  → 透明/淡底、噪点减半、光晕降 alpha
+ * ========================================================================== */
+.pg-light body::before {
+  background:
+    radial-gradient(1200px 560px at 10% -15%, rgba(47, 111, 219, 0.18), transparent 55%),
+    radial-gradient(900px 480px at 105% 4%, rgba(107, 79, 216, 0.14), transparent 50%),
+    radial-gradient(1000px 600px at 50% 118%, rgba(22, 163, 190, 0.09), transparent 55%),
+    var(--pg-bg);
+}
+.pg-light body::after {
+  mix-blend-mode: multiply;
+  opacity: 0.45;
+}
+.pg-light,
+.pg-light body {
+  --pg-glass: rgba(249, 250, 252, 0.62);
+  --pg-glass-strong: rgba(250, 251, 253, 0.82);
+  --pg-glass-saturate: 1.2;
+  --pg-hover-tint: rgba(47, 111, 219, 0.1);
+  --pg-hover-border: rgba(47, 111, 219, 0.32);
+  --pg-shadow-sm: 0 1px 3px rgba(30, 40, 55, 0.12);
+  --pg-shadow-md: 0 6px 20px rgba(30, 40, 55, 0.16);
+  --pg-shadow-lg: 0 14px 40px rgba(30, 40, 55, 0.24);
+}
+
+/* ============================================================================
+ * 备注
+ * - 若目标项目已有同名全局 body::before/::after，请把这两段合并进你自己的规则
+ * - color-mix() 方案（推荐，多主题更省事）：
+ *     background: color-mix(in srgb, var(--pg-accent) 30%, transparent);
+ *   Chromium 111+ / Safari 16.2+ / Firefox 113+ 均支持
+ * ========================================================================== */
