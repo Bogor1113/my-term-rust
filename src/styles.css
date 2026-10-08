@@ -41,6 +41,14 @@
   --tab-active-text: #dbe8ff;
   --edge-glow: rgba(79, 140, 255, 0.55);
   --inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.07), inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+  /* 背景氛围层光晕/网格：默认值对应深蓝主题（首屏在 applyUiPalette()
+     执行前也会用到），切换主题时由 themes.ts 重新注入 */
+  --amb-1: rgba(79, 140, 255, 0.3);
+  --amb-2: rgba(122, 92, 255, 0.22);
+  --amb-3: rgba(79, 140, 255, 0.14);
+  --amb-4: rgba(122, 92, 255, 0.12);
+  --amb-line: rgba(255, 255, 255, 0.025);
+  --amb-line-faint: rgba(255, 255, 255, 0.012);
 }
 
 /* ============================================================
@@ -85,24 +93,14 @@
   --inner-glow: inset 0 1px 0 rgba(255, 255, 255, 0.8), inset 0 -1px 0 rgba(20, 30, 45, 0.08);
 }
 
-:root[data-theme='light'] body::before {
-  background:
-    radial-gradient(1200px 560px at 10% -15%, rgba(47, 111, 219, 0.18), transparent 55%),
-    radial-gradient(900px 480px at 105% 4%, rgba(107, 79, 216, 0.14), transparent 50%),
-    radial-gradient(1000px 600px at 50% 118%, rgba(22, 163, 190, 0.09), transparent 55%),
-    radial-gradient(700px 400px at 80% 90%, rgba(47, 111, 219, 0.07), transparent 50%),
-    repeating-linear-gradient(0deg, rgba(40, 70, 110, 0.03) 0 1px, transparent 1px 56px),
-    repeating-linear-gradient(90deg, rgba(40, 70, 110, 0.03) 0 1px, transparent 1px 56px),
-    var(--bg);
-}
-
-/* 亮色噪点层：弱化颗粒感 + 改用加深混合模式 */
+/* 亮色主题的噪点层：弱化颗粒感 + 改用加深混合模式。
+   光晕/网格色已由 applyUiPalette() 注入，此处不再重复定义背景。 */
 :root[data-theme='light'] body::after {
   mix-blend-mode: multiply;
   opacity: 0.45;
 }
 
-/* 亮色玻璃面板高光：使用更亮的内发光 */
+/* 亮色玻璃面板高光：使用更亮的内发光（变量由 applyUiPalette 注入，此处仅覆写纯白高光） */
 :root[data-theme='light'] .sidebar::before,
 :root[data-theme='light'] .tabbar::before,
 :root[data-theme='light'] .sftp-panel::before {
@@ -182,7 +180,9 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* 主背景氛围层：多层光晕 + 双层网格 + 呼吸动画，透过半透明面板透出科技感 */
+/* 主背景氛围层：多层光晕 + 双层网格 + 呼吸动画，透过半透明面板透出科技感。
+   光晕色由 themes.ts 的 applyUiPalette() 按当前主题注入（--amb-*），
+   原先写死蓝/紫/青导致切到墨绿、暖橙主题时背景仍是蓝紫。 */
 body::before {
   content: '';
   position: fixed;
@@ -190,15 +190,15 @@ body::before {
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(1200px 560px at 10% -15%, rgba(79, 140, 255, 0.3), transparent 55%),
-    radial-gradient(900px 480px at 105% 4%, rgba(122, 92, 255, 0.22), transparent 50%),
-    radial-gradient(1100px 650px at 50% 120%, rgba(56, 193, 219, 0.14), transparent 55%),
-    radial-gradient(700px 400px at 80% 90%, rgba(79, 140, 255, 0.12), transparent 50%),
-    radial-gradient(600px 350px at 25% 70%, rgba(122, 92, 255, 0.09), transparent 50%),
-    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 56px),
-    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.025) 0 1px, transparent 1px 56px),
-    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 14px),
-    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.012) 0 1px, transparent 1px 14px),
+    radial-gradient(1200px 560px at 10% -15%, var(--amb-1), transparent 55%),
+    radial-gradient(900px 480px at 105% 4%, var(--amb-2), transparent 50%),
+    radial-gradient(1100px 650px at 50% 120%, var(--amb-3), transparent 55%),
+    radial-gradient(700px 400px at 80% 90%, var(--amb-4), transparent 50%),
+    radial-gradient(600px 350px at 25% 70%, var(--amb-3), transparent 50%),
+    repeating-linear-gradient(0deg, var(--amb-line) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(90deg, var(--amb-line) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(0deg, var(--amb-line-faint) 0 1px, transparent 1px 14px),
+    repeating-linear-gradient(90deg, var(--amb-line-faint) 0 1px, transparent 1px 14px),
     var(--bg);
   animation: ambient-breathe 8s ease-in-out infinite;
 }
@@ -297,8 +297,8 @@ textarea:focus-visible {
   overflow: hidden;
   background:
     var(--glass-noise),
-    radial-gradient(120% 280% at 4% -30%, rgba(79, 140, 255, 0.32), transparent 55%),
-    radial-gradient(90% 240% at 96% -40%, rgba(122, 92, 255, 0.24), transparent 55%),
+    radial-gradient(120% 280% at 4% -30%, var(--amb-1), transparent 55%),
+    radial-gradient(90% 240% at 96% -40%, var(--amb-2), transparent 55%),
     radial-gradient(70% 200% at 50% -60%, rgba(56, 193, 219, 0.1), transparent 60%),
     linear-gradient(180deg, var(--glass-strong), var(--glass) 80%);
   background-size: 120px 120px, auto, auto, auto, auto;
@@ -345,7 +345,7 @@ textarea:focus-visible {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.6px;
-  background: linear-gradient(90deg, #6fa8f6, #b58cff);
+  background: var(--accent-grad);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -385,12 +385,14 @@ textarea:focus-visible {
   color: #fff;
 }
 
-/* 亮色主题联动：背景沿用主题变量自动通透，仅微调高光与 hover */
+/* 亮色主题联动：背景沿用主题变量自动通透，仅微调高光与 hover。
+   顶部光晕改用 --amb-* （由 applyUiPalette 按主题注入），避免浅色主题下
+   标题栏残留固定蓝紫光。 */
 :root[data-theme='light'] .titlebar {
   background:
     var(--glass-noise),
-    radial-gradient(120% 280% at 4% -30%, rgba(47, 111, 219, 0.2), transparent 55%),
-    radial-gradient(90% 240% at 96% -40%, rgba(107, 79, 216, 0.14), transparent 55%),
+    radial-gradient(120% 280% at 4% -30%, var(--amb-1), transparent 55%),
+    radial-gradient(90% 240% at 96% -40%, var(--amb-2), transparent 55%),
     linear-gradient(180deg, var(--glass-strong), var(--glass) 80%);
   background-size: 120px 120px, auto, auto, auto;
 }
@@ -457,7 +459,7 @@ textarea:focus-visible {
 }
 
 .rm-cpu {
-  color: #6fa8f6;
+  color: var(--accent);
 }
 .rm-mem {
   color: #c792ea;
@@ -588,7 +590,7 @@ textarea:focus-visible {
   font-weight: 700;
   letter-spacing: 0.8px;
   text-transform: uppercase;
-  background: linear-gradient(90deg, #5b9cff, #7a5cff);
+  background: var(--accent-grad);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -1313,7 +1315,7 @@ textarea:focus-visible {
   font-size: 22px;
   font-weight: 700;
   letter-spacing: 1px;
-  background: linear-gradient(90deg, #6fa8f6, #b58cff);
+  background: var(--accent-grad);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -1464,7 +1466,7 @@ textarea:focus-visible {
   font-size: 15px;
   font-weight: 700;
   letter-spacing: 0.3px;
-  background: linear-gradient(90deg, #6fa8f6, #9a8cff);
+  background: var(--accent-grad);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -1889,7 +1891,7 @@ textarea:focus-visible {
 }
 
 .transfer-bar-fill.up {
-  background: linear-gradient(90deg, #4f8cff, #6fa8f6);
+  background: var(--accent-grad);
 }
 
 .transfer-bar-fill.down {
@@ -2365,31 +2367,6 @@ box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.18);
   align-content: start;
 }
 
-/* 横跨两栏的全宽卡片（集群趋势） */
-.cluster-span-all {
-  flex: 1 1 100%;
-  min-width: 0;
-}
-
-/* 趋势卡片内部：4 条曲线只允许「整齐」的两种形态 —— 宽屏一行 4 列、窄屏 2×2。
-   不用 auto-fit：4 个条目在 1100-1280 这段宽度会排成 3+1（第二行空两格），观感很散。
-   万一侧栏折叠导致实际宽度与媒体查询不符，退化成 4 列也只是更舒展，不会变乱。 */
-.cluster-trend-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px 20px;
-}
-
-@media (min-width: 1180px) {
-  .cluster-trend-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-}
-
-.cluster-trend-grid .cluster-trend-row {
-  margin-bottom: 0;
-}
-
 .cluster-section {
   margin-bottom: 18px;
 }
@@ -2697,34 +2674,6 @@ box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.18);
 
 .cluster-node-foot .danger {
   color: var(--danger);
-}
-
-/* ---------- 集群趋势（迷你曲线，复用 Spark 组件） ---------- */
-.cluster-trend-row {
-  margin-bottom: 10px;
-}
-
-.cluster-trend-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 3px;
-  font-size: 11px;
-  color: var(--text-faint);
-}
-
-.cluster-trend-head > b {
-  font-weight: 600;
-  color: var(--text-dim);
-}
-
-.cluster-spark {
-  display: block;
-  width: 100%;
-  height: 28px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--bg-hover) 40%, transparent);
 }
 
 /* 环形用量图 */

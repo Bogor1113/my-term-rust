@@ -55,6 +55,12 @@ function stripAnsi(s: string): string {
     .replace(/\u001b[=>78]/g, ''); // 其他单字符 ESC
 }
 
+// ---------- 提示符解析 ----------
+// 匹配常见 bash 提示符 `user@host:path#` / `user@host:path$`（含 root 的 #）。
+// 捕获组 1 为路径部分，可含 `~`、相对段等，由 App.handleCwdChange 归一化。
+// 供「完整行解析」与「残留缓冲解析」共用，保证两处判定口径一致。
+const PROMPT_RE = /^[^\s@]+@[^:\s]+:(.*?)([#$])(?:\s.*)?$/;
+
 // ---------- 字体缩放（Ctrl + 滚轮） ----------
 const FONT_SIZE_KEY = 'myterm.fontSize';
 const MIN_FONT = 9;
@@ -370,7 +376,7 @@ export default function TerminalTab({
   const handleOutputLine = useCallback(
     (line: string) => {
       if (!line) return;
-      const m = line.match(/^[^\s@]+@[^:\s]+:(.*?)([#$])(?:\s.*)?$/);
+      const m = line.match(PROMPT_RE);
       if (!m) return;
       const raw = (m[1] || '').trim();
       if (!raw) return;
@@ -400,6 +406,16 @@ export default function TerminalTab({
         handleOutputLine(line);
       }
       echoBufRef.current = buf;
+      // 残留缓冲解析：交互式 shell 的提示符**不带换行符**（它停在那里等输入），
+      // 因此上面的按 \n 分行永远看不到它 —— 只有后续命令产生输出才会把提示符
+      // 连带换行冲出来。这会导致 `cd ~` / `cd /opt` 这类「敲完就静默停住」的
+      // 命令不触发导航，必须再敲一次 ls/ll 才跟上。
+      // 这里对残留再解析一次，但要求残留**本身就是完整提示符行**（行首即匹配），
+      // 避免把半截命令回显（如 "cd ~" 自身）误判成路径。
+      if (buf) {
+        const tail = buf.replace(/\r+$/, '').trim();
+        if (PROMPT_RE.test(tail)) handleOutputLine(tail);
+      }
     },
     [handleOutputLine],
   );

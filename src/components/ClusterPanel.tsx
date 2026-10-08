@@ -25,7 +25,6 @@ import type {
   YarnMetrics,
   YarnNode,
 } from '../types';
-import { Spark } from './Spark';
 
 type ServiceAction = 'start' | 'stop' | 'restart';
 
@@ -116,19 +115,6 @@ function sinceText(ms: number): string {
 /** checkpoint 滞后告警阈值：Hadoop 默认每 100 万事务触发一次 checkpoint，
  *  这里取 10% 作为「已经开始积压」的预警线 */
 const CHECKPOINT_GAP_WARN = 100000;
-
-/** 趋势曲线采样上限（自动刷新 15s 一次 → 约 15 分钟窗口） */
-const TREND_MAX_POINTS = 60;
-
-/** 集群趋势历史：各序列等长（Spark 组件按序列长度对齐，长度不一致会错位） */
-interface TrendHist {
-  diskPct: number[];
-  runningApps: number[];
-  nmFreeGb: number[];
-  nnHeapMb: number[];
-}
-
-const emptyTrend: TrendHist = { diskPct: [], runningApps: [], nmFreeGb: [], nnHeapMb: [] };
 
 /** 一条集群健康告警 */
 interface HealthIssue {
@@ -506,77 +492,6 @@ function YarnNodeList({ nodes }: { nodes: YarnNode[] }) {
   );
 }
 
-/** 集群趋势（等间隔采样点）：开启"自动刷新"才会形成连续曲线 */
-function ClusterTrend({ hist }: { hist: TrendHist }) {
-  const n = hist.diskPct.length;
-  if (n === 0) {
-    return (
-      <div className="cluster-chart-empty">
-        尚无采样点
-        <div className="cluster-chart-reason">
-          每次刷新记录一个点；开启上方"自动刷新"即可形成连续趋势
-        </div>
-      </div>
-    );
-  }
-  const last = (a: number[]) => a[a.length - 1];
-  /** 量程：取窗口峰值再留 10% 余量，并给下限 —— 否则全 0 时曲线贴底看不出变化 */
-  const range = (a: number[], floor: number) => Math.max(floor, ...a) * 1.1;
-  const rows = [
-    {
-      label: '磁盘占用',
-      value: `${last(hist.diskPct).toFixed(1)}%`,
-      values: hist.diskPct,
-      max: 100,
-      color: 'var(--accent)',
-    },
-    {
-      label: '运行中应用',
-      value: String(last(hist.runningApps)),
-      values: hist.runningApps,
-      max: range(hist.runningApps, 2),
-      color: 'var(--green)',
-    },
-    {
-      label: 'NM 剩余内存',
-      value: `${last(hist.nmFreeGb).toFixed(1)} GB`,
-      values: hist.nmFreeGb,
-      max: range(hist.nmFreeGb, 1),
-      color: 'var(--warn)',
-    },
-    {
-      label: 'NameNode 堆',
-      value: `${Math.round(last(hist.nnHeapMb))} MB`,
-      values: hist.nnHeapMb,
-      max: range(hist.nnHeapMb, 64),
-      color: 'var(--accent)',
-    },
-  ];
-  return (
-    <>
-      <div className="cluster-trend-grid">
-        {rows.map((r) => (
-          <div className="cluster-trend-row" key={r.label}>
-            <div className="cluster-trend-head">
-              <span>{r.label}</span>
-              <b className="mono">{r.value}</b>
-            </div>
-            <Spark
-              className="cluster-spark"
-              series={[{ values: r.values, color: r.color }]}
-              max={r.max}
-            />
-          </div>
-        ))}
-      </div>
-      <div className="cluster-node-foot">
-        共 {n} 个采样点
-        {n < TREND_MAX_POINTS ? `（满 ${TREND_MAX_POINTS} 点后滚动）` : ''}
-      </div>
-    </>
-  );
-}
-
 export default function ClusterPanel({
   tab,
   active = true,
@@ -609,9 +524,6 @@ export default function ClusterPanel({
   const [hdfsNodes, setHdfsNodes] = useState<HdfsNodes | null>(null);
   const [yarnNodes, setYarnNodes] = useState<YarnNode[] | null>(null);
   const [yarnNodesError, setYarnNodesError] = useState('');
-  // 趋势采样历史（每次刷新推一个点；用 ref 累积，避免依赖 state 闭包）
-  const [trend, setTrend] = useState<TrendHist>(emptyTrend);
-  const trendRef = useRef<TrendHist>(emptyTrend);
   // 正在执行的服务操作（key -> action），行内显示"启动中…/停止中…/重启中…"
   const [operating, setOperating] = useState<Record<string, ServiceAction>>({});
   // 服务操作结果提示（成功/失败）
@@ -865,9 +777,6 @@ export default function ClusterPanel({
 
   // 挂载时加载 + 自动刷新定时器
   useEffect(() => {
-    // 会话切换：清掉上一台集群的趋势，避免曲线串台
-    trendRef.current = emptyTrend;
-    setTrend(emptyTrend);
     void loadAll();
     void loadHdfs('/');
     return () => {
@@ -908,34 +817,6 @@ export default function ClusterPanel({
     }
     wasActiveRef.current = active;
   }, [active, autoRefresh, loadLight]);
-
-  // 趋势采样：每次数据刷新推入一个点。
-  // 只有三个来源**同时**有效时才采样——各序列必须等长（Spark 按长度对齐），
-  // 某一来源缺失时宁可不采样，也不要插入 0 把曲线拉歪。
-  useEffect(() => {
-    if (!hdfsSum || !yarnMet || !nnJvm) return;
-    const diskTotal = hdfsSum.capacityTotalGb + hdfsSum.capacityUsedNonDfsGb;
-    if (diskTotal <= 0) return;
-    const push = (arr: number[], v: number) =>
-      arr.length >= TREND_MAX_POINTS
-        ? [...arr.slice(arr.length - TREND_MAX_POINTS + 1), v]
-        : [...arr, v];
-    const prev = trendRef.current;
-    const next: TrendHist = {
-      diskPct: push(
-        prev.diskPct,
-        ((hdfsSum.capacityUsedGb + hdfsSum.capacityUsedNonDfsGb) / diskTotal) * 100,
-      ),
-      runningApps: push(prev.runningApps, yarnMet.runningApps),
-      nmFreeGb: push(
-        prev.nmFreeGb,
-        (yarnNodes ?? []).reduce((s, n) => s + n.availableMemoryMb, 0) / 1024,
-      ),
-      nnHeapMb: push(prev.nnHeapMb, nnJvm.heapUsedMb),
-    };
-    trendRef.current = next;
-    setTrend(next);
-  }, [hdfsSum, yarnMet, nnJvm, yarnNodes]);
 
   // 显示操作结果提示（成功后自动消失）
   const showNotice = useCallback((type: 'ok' | 'error', msg: string) => {
@@ -1076,13 +957,6 @@ export default function ClusterPanel({
       )}
 
       <div className="cluster-body cluster-cols">
-        {/* 集群趋势：横跨两栏的全宽卡片。
-            原先塞在 320px 的右栏里，4 条曲线各只有 ~290px 宽（而且右栏越窄越挤）；
-            提到全宽后 4 条曲线并排铺开，趋势可读性大幅提升。 */}
-        <section className="cluster-chart-card cluster-span-all">
-          <div className="cluster-chart-title">集群趋势</div>
-          <ClusterTrend hist={trend} />
-        </section>
         <div className="cluster-col-main">
           {/* 服务区 */}
           <section className="cluster-section">

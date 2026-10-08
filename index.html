@@ -6,7 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>myterm-波哥自研</title>
     <style>
-      /* 启动期背景色：WebView2 加载 CSS 之前先显示主题底色（--bg: #0e1116），避免白色闪烁 */
+      /* 启动期背景色兜底：WebView2 加载 CSS 之前先铺底色，避免白色闪烁。
+         具体颜色由下方同步脚本按「上次保存的主题」覆写——若写死深色，
+         浅色主题下重启会先闪一下深色。 */
       html,
       body {
         background-color: #0e1116;
@@ -14,6 +16,33 @@
         padding: 0;
       }
     </style>
+    <script>
+      /* 首帧前同步应用主题底色（必须内联且同步执行，放在 CSS 之后、body 之前）。
+         这里只做「底色」这一件事，完整调色板仍由 themes.ts 的 applyUiPalette()
+         在 React 挂载后写入。各主题 bg 与 themes.ts 的 UI_PALETTES 保持一致。 */
+      (function () {
+        var BG = {
+          ocean: '#0e1116',
+          windterm: '#1c1c1c',
+          'classic-green': '#000000',
+          light: '#f5f6f7',
+          'solarized-dark': '#002b36',
+          dracula: '#282a36',
+          gruvbox: '#282828',
+          nord: '#2e3440',
+        };
+        try {
+          var id = localStorage.getItem('myterm.theme');
+          var bg = (id && BG[id]) || BG.ocean;
+          document.documentElement.style.backgroundColor = bg;
+          document.documentElement.dataset.theme =
+            (id === 'light' || bg === '#f5f6f7') ? 'light' : 'dark';
+          document.documentElement.dataset.themeId = id && BG[id] ? id : 'ocean';
+        } catch (e) {
+          /* localStorage 不可用时保持默认深色 */
+        }
+      })();
+    </script>
   </head>
 
   <body>

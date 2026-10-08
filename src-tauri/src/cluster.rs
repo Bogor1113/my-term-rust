@@ -182,7 +182,16 @@ fn get_service_configs() -> Vec<ServiceConfig> {
             // 精确匹配用户环境实际主类 org.apache.dolphinscheduler.StandaloneServer
             //（另兼容 jar 打包名 dolphinscheduler-standalone-server）。
             // 运行中 = 进程存在 AND 12345 端口（API server）监听——只有 API 就绪才算启动成功
-            check_cmd: "p=$(pgrep -f '[o]rg.apache.dolphinscheduler.StandaloneServer|dolphinscheduler-standalone-server' | head -1); if [ -n \"$p\" ] && ss -tln 2>/dev/null | grep -q ':12345 '; then echo 'running'; else echo 'stopped'; fi; pgrep -f '[o]rg.apache.dolphinscheduler.StandaloneServer|dolphinscheduler-standalone-server' | wc -l".to_string(),
+            //
+            // ⚠ 两个分支都必须带 [x] 字符类防护，缺一不可：
+            // pgrep -f 会匹配「自己的 cmdline」（含本命令文本）。`[o]` 之所以能自防护，
+            // 是因为 cmdline 里字面量是 `[o]rg...`（含方括号），而正则 [o]rg 匹配的是
+            // 无方括号的 `org`——两者永不相等。但 OR 组合 `A|B` 中，B 分支的字面文本
+            // `dolphinscheduler-standalone-server` 会原样出现在本命令 cmdline 里，
+            // 且 B 正则能匹配它自身 → pgrep 把管道子壳(bash)也算进来。
+            // 实测：`[o]...StandaloneServer|dolphinscheduler-standalone-server` 命中 2~4 个，
+            // 其中若干为 bash 假阳性；加 [d] 防护后恒为 1（仅真实 java 进程）。
+            check_cmd: "p=$(pgrep -f '[o]rg.apache.dolphinscheduler.StandaloneServer|[d]olphinscheduler-standalone-server' | head -1); if [ -n \"$p\" ] && ss -tln 2>/dev/null | grep -q ':12345 '; then echo 'running'; else echo 'stopped'; fi; pgrep -f '[o]rg.apache.dolphinscheduler.StandaloneServer|[d]olphinscheduler-standalone-server' | wc -l".to_string(),
             // 借鉴 offline-warehouse 脚本：nohup + & 后台启动，shell 立即退出、SSH exec
             // 通道随之关闭立即返回；就绪与否交给后续 wait_status 轮询 12345 端口判定。
             // 原先前台 exec dolphinscheduler-daemon.sh start，standalone 模式下 daemon.sh
@@ -193,7 +202,7 @@ fn get_service_configs() -> Vec<ServiceConfig> {
             // SIGTERM 优雅关闭可能极慢甚至卡死）。
             stop_cmd: format!("{}bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh stop standalone-server; sleep 5", SOURCE),
             restart_cmd: None,
-            port_cmd: port_cmd("[o]rg.apache.dolphinscheduler.StandaloneServer|dolphinscheduler-standalone-server"),
+            port_cmd: port_cmd("[o]rg.apache.dolphinscheduler.StandaloneServer|[d]olphinscheduler-standalone-server"),
         },
         ServiceConfig {
             key: "MySQL",
@@ -800,7 +809,7 @@ impl ClusterManager {
             // kill -9 强杀残留（对齐 offline-warehouse 脚本 stop_dolphin）：
             // Dolphin standalone 内嵌 zk + 多组件，SIGTERM 优雅关闭不可靠，
             // 强杀干净利落，避免 wait_status 轮询到超时仍报"停止失败"。
-            "DolphinScheduler" => "pgrep -f '[o]rg.apache.dolphinscheduler.StandaloneServer|dolphinscheduler-standalone-server' | xargs -r kill -9 2>/dev/null".to_string(),
+            "DolphinScheduler" => "pgrep -f '[o]rg.apache.dolphinscheduler.StandaloneServer|[d]olphinscheduler-standalone-server' | xargs -r kill -9 2>/dev/null".to_string(),
             // start-all/stop-all 是整体操作：无论从 Master 还是 Worker 行发起，
             // 兜底 kill 都清掉 master + worker 全部，避免停一半
             "SparkMaster" | "SparkWorker" => "pgrep -f '[o]rg.apache.spark.deploy.master.Master|[o]rg.apache.spark.deploy.worker.Worker' | xargs -r kill 2>/dev/null".to_string(),
@@ -890,7 +899,7 @@ impl ClusterManager {
             "HDFS" => "[Nn]ame[Nn]ode|[Dd]ata[Nn]ode",
             "YARN" => "[Rr]esource[Mm]anager|[Nn]ode[Mm]anager",
             "Hive" => "[o]rg.apache.hadoop.hive.metastore.HiveMetaStore|[o]rg.apache.hive.service.server.HiveServer2",
-            "DolphinScheduler" => "[o]rg.apache.dolphinscheduler.StandaloneServer|dolphinscheduler-standalone-server",
+            "DolphinScheduler" => "[o]rg.apache.dolphinscheduler.StandaloneServer|[d]olphinscheduler-standalone-server",
             "SparkMaster" | "SparkWorker" => "[o]rg.apache.spark.deploy.master.Master|[o]rg.apache.spark.deploy.worker.Worker",
             "MySQL" => "[m]ysqld",
             _ => return String::new(),

@@ -1,6 +1,6 @@
 [package]
 name = "myterm"
-version = "1.0.41"
+version = "1.0.44"
 description = "MyTerm - 跨平台远程 SSH 终端工具，集成 SFTP 文件管理与系统资源监控"
 authors = ["MyTerm"]
 edition = "2021"
@@ -11,6 +11,21 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# ---- 兼容性修复：schemars 0.8.22 + indexmap 1.x 在 rustc 1.98 下 E0107 ----
+# 报错：schemars-0.8.22/src/lib.rs:12 `indexmap::IndexMap<K, V>` —— E0107
+#       “struct takes 3 generic arguments but 2 generic arguments were supplied”
+# 根因（逐层验证）：
+#   1. tauri-build / tauri-utils 经 `schema` 能力启用 schemars 0.8.22 的
+#      `preserve_order` feature；该 feature 依赖 indexmap 1.x，但只请求 `serde-1`。
+#   2. indexmap 1.9.3 的 build.rs：显式请求 `std` 时才直接 emit("has_std")，
+#      否则用 autocfg 探测 sysroot —— 探测在 rustc 1.98 上失败 → `has_std` 未置位。
+#   3. 于是命中 `#[cfg(not(has_std))] pub struct IndexMap<K, V, S>`（无默认泛型参数），
+#      而 schemars 源码按两参数 `IndexMap<K, V>` 使用 → E0107。
+# 关键点：schemars 位于 **host build-dependency 图**中，Cargo 的 feature 解析在
+#   host / target 图之间不合并 —— 因此修复必须加在 [build-dependencies] 侧，
+#   加在 [dependencies] 侧无效（已实测验证）。
+# 修复：在 host 依赖图中显式请求 indexmap 1.x 的 `std` feature。
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }

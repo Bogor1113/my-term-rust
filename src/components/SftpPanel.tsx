@@ -160,14 +160,18 @@ const SftpFileList = memo(function SftpFileList({
             <span className="sftp-size">{e.isDir ? '—' : formatSize(e.size)}</span>
             <span className="sftp-perms">{e.perms}</span>
             <span className="sftp-actions">
-              {!e.isDir && (
-                <button className="mini-btn" title="下载" onClick={() => onDownload(e)}>
-                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 4v12M7 11l5 5 5-5" />
-                    <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
-                  </svg>
-                </button>
-              )}
+              {/* 文件夹同样提供下载入口：后端 sftp_download 已支持整目录递归下载，
+                  此前仅靠右键菜单暴露，行内无按钮导致用户以为不支持下载文件夹 */}
+              <button
+                className="mini-btn"
+                title={e.isDir ? '下载文件夹' : '下载'}
+                onClick={() => onDownload(e)}
+              >
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 4v12M7 11l5 5 5-5" />
+                  <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+                </svg>
+              </button>
               <button className="mini-btn" title="重命名" onClick={() => onRename(e)}>
                 <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
@@ -599,8 +603,12 @@ export default function SftpPanel({
   const download = async (entry: SftpEntry) => {
     if (entry.isDir) {
       // 目录：选择本地保存位置，整目录递归下载
+      // recursive: true 必须显式传入 —— dialog 插件在选中目录时会执行
+      // allow_directory(path, recursive) 把该目录写入 fs scope；缺省 false 时
+      // 仅授权目录本身而不含子项，递归写入会被 scope 拦下。
       const picked = await open({
         directory: true,
+        recursive: true,
         title: `选择保存位置（将下载整个文件夹「${entry.name}」）`,
       });
       if (!picked) return;

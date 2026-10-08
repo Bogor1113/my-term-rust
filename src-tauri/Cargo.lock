@@ -2891,11 +2891,12 @@ dependencies = [
 
 [[package]]
 name = "myterm"
-version = "1.0.41"
+version = "1.0.44"
 dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "indexmap 1.9.3",
  "reqwest 0.12.28",
  "russh",
  "russh-sftp",

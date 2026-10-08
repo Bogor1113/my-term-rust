@@ -16,7 +16,7 @@ import Modal from './components/Modal';
 import TitleBar from './components/TitleBar';
 import { bytesToBase64, listSessions, sftpHome, sendInput } from './api';
 import type { SavedHost, SessionSummary, TabInfo } from './types';
-import { TERM_THEMES, applyTermTheme, getSavedThemeId, isLightTheme } from './themes';
+import { TERM_THEMES, applyTermTheme, applyUiPalette, getSavedThemeId } from './themes';
 import './styles.css';
 
 const HOSTS_KEY = 'myterm.hosts';
@@ -281,9 +281,10 @@ export default function App() {
     };
   }, []);
 
-  // 明亮主题联动：终端选择浅色主题时，UI 外壳（侧边栏/标签栏/面板）跟随切换
+  // 主题联动：切换终端配色时，整个界面外壳（侧边栏 / 标签栏 / SFTP / 集群面板 /
+  // 弹窗 / 资源监控）的 CSS 变量一并换成该主题的调色板——不再只区分深/浅两态。
   useEffect(() => {
-    document.documentElement.dataset.theme = isLightTheme(themeId) ? 'light' : 'dark';
+    applyUiPalette(themeId);
   }, [themeId]);
 
   const pickTheme = (id: string) => {
