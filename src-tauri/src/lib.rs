@@ -74,8 +74,13 @@ pub struct AppState {
     /// 每个会话的远程监控取消信号发送端
     pub monitor_cancels: tokio::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     /// 传输同名冲突等待回复：request_id -> oneshot 发送端
+    ///
+    /// 用 std::sync::Mutex 而非 tokio Mutex：这里的操作全是"插入/移除/发送"
+    /// 这类瞬时同步动作，从不跨 await 持有。但 `PendingConflictGuard::drop`
+    /// 只能在同步上下文里清理条目（tokio Mutex 的 blocking_lock 会在
+    /// runtime 线程上 panic），改用 std 锁后 Drop 才能安全地做清理。
     pub conflict_resolvers:
-        tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<sftp::ConflictChoice>>>,
+        std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<sftp::ConflictChoice>>>,
     /// 集群服务状态缓存（Hadoop 生态服务检测结果）。
     /// 用 Arc 而非 Mutex：内部缓存/探针各自有独立同步原语，外层加锁反而会让
     /// 长操作（单次检测 8s、启动等待最长 90s）互斥阻塞其他命令。
@@ -99,7 +104,7 @@ impl Default for AppState {
         Self {
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             monitor_cancels: tokio::sync::Mutex::new(HashMap::new()),
-            conflict_resolvers: tokio::sync::Mutex::new(HashMap::new()),
+            conflict_resolvers: std::sync::Mutex::new(HashMap::new()),
             cluster: std::sync::Arc::new(cluster::ClusterManager::new()),
             forwards: tokio::sync::Mutex::new(HashMap::new()),
             session_log: tokio::sync::RwLock::new(ssh::SessionLogConfig::default()),

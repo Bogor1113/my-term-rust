@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ResourceMonitor from './components/ResourceMonitor';
 import Sidebar from './components/Sidebar';
 import GroupManager from './components/GroupManager';
@@ -18,6 +18,9 @@ import { bytesToBase64, listSessions, sftpHome, sendInput } from './api';
 import type { SavedHost, SessionSummary, TabInfo } from './types';
 import { TERM_THEMES, applyTermTheme, applyUiPalette, getSavedThemeId } from './themes';
 import './styles.css';
+
+/** 稳定的空数组常量：用于避免把新的 [] 作为 props 反复传给子组件 */
+const EMPTY_IDS: string[] = [];
 
 const HOSTS_KEY = 'myterm.hosts';
 const SIDEBAR_KEY = 'myterm.sidebar';
@@ -181,6 +184,8 @@ export default function App() {
 
   // 每个会话的 home 与当前目录
   const homeDirRef = useRef<Record<string, string>>({});
+  // 已关闭的会话 id：在途异步回调据此自查，避免复活已删除的条目
+  const closedIdsRef = useRef<Set<string>>(new Set());
   const cwdDirRef = useRef<Record<string, string>>({});
   const prevCwdRef = useRef<Record<string, string>>({});
   // 待提交的 OLDPWD：cd 发起时先暂存，面板成功加载目标目录后才提交到
@@ -338,17 +343,32 @@ export default function App() {
     setSftpOpen(false);
   };
 
+  // 拉取已连接会话。抽成独立函数供集群选择器与端口转发面板共用 ——
+// 端口转发面板此前只在"先打开过集群选择器"时才拿得到会话列表，
+  // 于是不经过集群入口的用户永远只能看到"暂无已连接会话"。
+  const refreshConnectedSessions = useCallback(async () => {
+    try {
+      const sessions = await listSessions();
+      setConnectedSessions(sessions.filter((s) => s.status === 'connected'));
+      return true;
+    } catch (e) {
+      setConnectedSessions([]);
+      setClusterNotice(`获取会话列表失败：${String(e)}`);
+      return false;
+    }
+  }, []);
+
   // 打开集群监控标签：弹出已连接会话选择器
   const openClusterPicker = useCallback(() => {
     setClusterNotice(null);
-    void listSessions()
-      .then((sessions) => {
-        // 仅列出仍处于连接状态的会话
-        setConnectedSessions(sessions.filter((s) => s.status === 'connected'));
-      })
-      .catch(() => setConnectedSessions([]));
+    void refreshConnectedSessions();
     setClusterPickerOpen(true);
-  }, []);
+  }, [refreshConnectedSessions]);
+
+  // 端口转发面板打开时同步一次会话列表（该面板按需展示可选会话）
+  useEffect(() => {
+    if (forwardOpen) void refreshConnectedSessions();
+  }, [forwardOpen, refreshConnectedSessions]);
 
   // 基于已连接会话创建集群监控标签。
   // 打开前两道检测：
@@ -417,6 +437,9 @@ export default function App() {
     delete pendingPrevRef.current[id];
     delete lastNavCwdRef.current[id];
     delete pendingCwdRef.current[id];
+    // 标记为已关闭：在途的 sftpHome 等异步回调回来后据此判断，
+    // 不要把一个已关闭会话的 home 重新写回 homeDirRef（那会造成永不回收的残留）
+    closedIdsRef.current.add(id);
     // 若关闭的是右侧分屏标签，则退出分屏
     if (splitPartnerId === id) setSplitPartnerId(null);
   };
@@ -469,15 +492,30 @@ export default function App() {
   const startSplitDrag = useCallback((e: React.PointerEvent) => {
     e.preventDefault();
     draggingSplitRef.current = true;
+    // 合帧：pointermove 每秒可触发上百次，每次都会 setState 触发 App 整体重渲染
+    // （进而重渲染所有标签的终端/集群面板）。
+    let raf: number | null = null;
+    let pendingRatio = 0;
+    const flush = () => {
+      raf = null;
+      if (!draggingSplitRef.current) return;
+      setSplitRatio(pendingRatio);
+    };
     const move = (ev: PointerEvent) => {
       if (!draggingSplitRef.current || !splitAreaRef.current) return;
       const r = splitAreaRef.current.getBoundingClientRect();
       if (r.width <= 0) return;
-      const ratio = Math.min(0.85, Math.max(0.15, (ev.clientX - r.left) / r.width));
-      setSplitRatio(ratio);
+      pendingRatio = Math.min(0.85, Math.max(0.15, (ev.clientX - r.left) / r.width));
+      if (raf === null) raf = requestAnimationFrame(flush);
     };
     const up = () => {
       draggingSplitRef.current = false;
+      // 最后一帧必须刷出去，否则松手瞬间的位置会被丢掉
+      if (raf !== null) {
+        cancelAnimationFrame(raf);
+        raf = null;
+        setSplitRatio(pendingRatio);
+      }
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
     };
@@ -588,9 +626,19 @@ export default function App() {
   }, [activeTab]);
 
   // 所有 SSH 会话标签的 id（广播 / 片段发送的目标）
-  const sshTabIds = tabs.filter((t) => t.kind === 'ssh').map((t) => t.id);
+  // useMemo 避免每次渲染都产生新数组 —— sendCommand 的 useCallback 依赖它，
+  // 否则该回调每次渲染都会重建，片段面板会被无谓地反复重渲染。
+  const sshTabIds = useMemo(
+    () => tabs.filter((t) => t.kind === 'ssh').map((t) => t.id),
+    [tabs],
+  );
   // 广播模式下 TerminalTab 输入的目标 id 列表（含源终端自身）
-  const broadcastTargets = broadcast && sshTabIds.length > 1 ? sshTabIds : [];
+  // 保持引用稳定：每次渲染都新建数组会让 TerminalTab 的 props 恒定变化，
+// 即便日后加了 memo 也无法生效；EMPTY 更是避免所有终端都被广播逻辑唤醒
+  const broadcastTargets = useMemo(
+    () => (broadcast && sshTabIds.length > 1 ? sshTabIds : EMPTY_IDS),
+    [broadcast, sshTabIds],
+  );
 
   // 发送一段命令：广播开启则复制到所有 SSH 会话，否则发到当前激活的 SSH 会话
   const sendCommand = useCallback(
@@ -619,6 +667,9 @@ export default function App() {
       if (!home) {
         try {
           home = await sftpHome(sessionId);
+          // await 期间标签可能已被关闭：此时写入等于给一个不存在的会话
+          // 建出一条永远不会再被回收的 home 记录
+          if (closedIdsRef.current.has(sessionId)) return;
           homeDirRef.current[sessionId] = home;
         } catch {
           home = undefined;
@@ -632,8 +683,9 @@ export default function App() {
       const cwd = cwdDirRef.current[sessionId] || baseHome;
       const target = resolveCdPath(arg, cwd, baseHome, prevCwdRef.current[sessionId]);
       if (!target) return;
-      // 异步等待期间用户可能已切换标签，避免导航到错误的会话面板
+      // 异步等待期间用户可能已切换标签或直接关掉了该标签
       if (sessionId !== activeIdRef.current) return;
+      if (closedIdsRef.current.has(sessionId)) return;
       // 记录前一个目录；仅当面板成功加载目标目录后（onPathLoaded）才
       // 提交为 OLDPWD，避免 cd 敲错路径后污染 `cd -` 的目标
       pendingPrevRef.current[sessionId] = cwd;
@@ -681,6 +733,7 @@ export default function App() {
   // SFTP 面板 / 终端获取到 home 目录后记录，并补解析之前缺 home 挂起的提示符路径
   const handleHomeReady = useCallback(
     (id: string, home: string) => {
+      if (closedIdsRef.current.has(id)) return;
       homeDirRef.current[id] = home;
       const pend = pendingCwdRef.current[id];
       if (pend) handleCwdChange(id, pend);

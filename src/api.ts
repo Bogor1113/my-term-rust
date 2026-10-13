@@ -22,7 +22,9 @@ import type {
 /** 后端推送的终端事件（与 Rust 端 TerminalEvent 对应） */
 export type TerminalEvent =
   | { type: 'data'; data: string }
-  | { type: 'close'; data: { reason: 'eof' | 'close' | 'drop' } };
+  | { type: 'close'; data: { reason: 'eof' | 'close' | 'drop' } }
+  /** 后端检测到的会话级错误（如写入超时）。不携带 close，避免把可恢复故障当断开处理 */
+  | { type: 'error'; data: string };
 
 // ---------- base64 工具 ----------
 

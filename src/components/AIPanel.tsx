@@ -46,6 +46,13 @@ function loadActive(profiles: AiProfile[]): string {
 
 const CHAT_KEY = 'myterm.aiChat';
 
+/** 为消息生成稳定 id（持久化记录里没有 id 的旧数据也在这里补上） */
+let msgSeq = 0;
+function nextMsgId(): string {
+  msgSeq += 1;
+  return `m${Date.now().toString(36)}-${msgSeq}`;
+}
+
 /** 读取持久化的对话记录（逐条校验结构，异常时返回空，面板关闭重开不丢对话） */
 function loadChat(): AiMessage[] {
   try {
@@ -53,13 +60,16 @@ function loadChat(): AiMessage[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (m): m is AiMessage =>
-        typeof m === 'object' &&
-        m !== null &&
-        ((m as AiMessage).role === 'user' || (m as AiMessage).role === 'assistant') &&
-        typeof (m as AiMessage).content === 'string',
-    );
+    return parsed
+      .filter(
+        (m): m is AiMessage =>
+          typeof m === 'object' &&
+          m !== null &&
+          ((m as AiMessage).role === 'user' || (m as AiMessage).role === 'assistant') &&
+          typeof (m as AiMessage).content === 'string',
+      )
+      // 旧版本持久化的记录没有 id，这里补齐以保证 key 稳定
+      .map((m) => ({ ...m, id: typeof m.id === 'string' ? m.id : nextMsgId() }));
   } catch {
     return [];
   }
@@ -108,6 +118,24 @@ export default function AIPanel({ sessionId, onClose }: Props) {
   const unlistenRef = useRef<(() => void)[]>([]);
   // 当前进行中的流式请求 id（「停止生成」按钮使用）
   const reqIdRef = useRef<string | null>(null);
+  // 请求代次：用于丢弃上一轮（已被停止 / 已过期）请求的迟到回调
+  const reqGenRef = useRef(0);
+  // 对话持久化防抖定时器
+  const persistTimerRef = useRef<number | null>(null);
+  // 组件是否存活：在两次 await 之间防止把监听器注册到已卸载的面板上
+  const aliveRef = useRef(true);
+  // 弹窗自动聚焦的定时器句柄（卸载时清理）
+  const focusTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      if (focusTimerRef.current !== null) {
+        window.clearTimeout(focusTimerRef.current);
+        focusTimerRef.current = null;
+      }
+    };
+  }, []);
 
   // 初始化时恢复 profiles 与选中项
   useEffect(() => {
@@ -133,12 +161,26 @@ export default function AIPanel({ sessionId, onClose }: Props) {
   }, [activeId]);
 
   // 对话记录持久化（带上限裁剪；「清空对话」后存入空数组即视为重置）
+  //
+  // 必须防抖：流式回答期间 messages 每个分片都会变一次，原实现对每次变更都做
+  // 一次 JSON.stringify(全量) + **同步阻塞**的 localStorage.setItem。
+  // 一段稍长的回答就是每秒几十次全量序列化加磁盘同步写，把主线程压满。
   useEffect(() => {
-    try {
-      localStorage.setItem(CHAT_KEY, JSON.stringify(messages.slice(-MAX_MESSAGES)));
-    } catch {
-      /* 存储失败时忽略 */
-    }
+    if (persistTimerRef.current !== null) window.clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = window.setTimeout(() => {
+      persistTimerRef.current = null;
+      try {
+        localStorage.setItem(CHAT_KEY, JSON.stringify(messages.slice(-MAX_MESSAGES)));
+      } catch {
+        /* 存储失败时忽略 */
+      }
+    }, 800);
+    return () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+    };
   }, [messages]);
 
   // Esc 关闭 + 卸载时清理监听。
@@ -203,20 +245,26 @@ export default function AIPanel({ sessionId, onClose }: Props) {
       setConfigOpen(true);
       return;
     }
-    const userMsg: AiMessage = { role: 'user', content: text };
+    const userMsg: AiMessage = { role: 'user', content: text, id: nextMsgId() };
     let next = [...messages, userMsg];
     // 超出上限时裁剪最旧消息，并确保裁剪后仍以用户消息开头（符合对话 API 习惯）
     if (next.length > MAX_MESSAGES) {
       next = next.slice(-MAX_MESSAGES);
       while (next.length > 0 && next[0].role !== 'user') next.shift();
     }
-    setMessages([...next, { role: 'assistant', content: '' }]);
+    setMessages([...next, { role: 'assistant', content: '', id: nextMsgId() }]);
     setInput('');
     setError('');
     setStreaming(true);
 
     const reqId = makeId();
     reqIdRef.current = reqId;
+    // 请求代次：stopStreaming 之后用户可以立刻发新问题，而本轮的
+    // aiChatStream await 仍未结束。等它 settle 时，cleanupListeners /
+    // setStreaming 会把**新请求**的 reqId 与状态一起清掉 ——
+    // 之后按"停止生成"停掉的是错误的请求。
+    const myGen = ++reqGenRef.current;
+    const isCurrent = () => myGen === reqGenRef.current;
     let acc = '';
     let unChunk: (() => void) | null = null;
     let unDone: (() => void) | null = null;
@@ -231,20 +279,34 @@ export default function AIPanel({ sessionId, onClose }: Props) {
         unlistenRef.current = unlistenRef.current.filter((f) => f !== unDone);
         unDone = null;
       }
-      reqIdRef.current = null;
+      if (isCurrent()) reqIdRef.current = null;
     };
     try {
       unChunk = await listen<string>(`ai-chunk-${reqId}`, (e) => {
+        if (!isCurrent()) return;
         acc += e.payload;
         updateLastAssistant(acc);
       });
+      // 两次 await 之间组件可能已经卸载（关闭面板）：此时上面的清理函数
+      // 已经跑完、unlistenRef 已清空，再 push 进去的监听器将**永远不会被移除**，
+      // 变成持续对已卸载组件 setState 的常驻监听。
+      if (!aliveRef.current) {
+        unChunk();
+        return;
+      }
       unDone = await listen(`ai-done-${reqId}`, () => {
+        if (!isCurrent()) return;
         cleanupListeners();
         setStreaming(false);
       });
+      if (!aliveRef.current) {
+        cleanupListeners();
+        return;
+      }
       unlistenRef.current.push(unChunk, unDone);
     } catch (e) {
       cleanupListeners();
+      if (!isCurrent()) return;
       setStreaming(false);
       updateLastAssistant(acc ? `${acc}\n\n（请求中断：${e}）` : `（请求失败：${e}）`);
       setError(String(e));
@@ -255,6 +317,7 @@ export default function AIPanel({ sessionId, onClose }: Props) {
       await aiChatStream(reqId, activeProfile.config, next);
     } catch (e) {
       cleanupListeners();
+      if (!isCurrent()) return;
       setStreaming(false);
       updateLastAssistant(acc ? `${acc}\n\n（请求中断：${e}）` : `（请求失败：${e}）`);
       setError(String(e));
@@ -267,6 +330,8 @@ export default function AIPanel({ sessionId, onClose }: Props) {
     if (!streaming) return;
     const id = reqIdRef.current;
     if (id) void aiChatCancel(id).catch(() => {});
+    // 作废本代：旧请求的 await 结束后不再有权改动界面状态
+    reqGenRef.current += 1;
     unlistenRef.current.forEach((fn) => {
       try {
         fn();
@@ -333,9 +398,16 @@ export default function AIPanel({ sessionId, onClose }: Props) {
         : emptyEditable,
     );
     setConfigOpen(true);
-    // 弹窗打开后延迟聚焦第一个输入域，确保输入框可见
-    setTimeout(() => {
-      const firstInput = document.querySelector('.modal-backdrop .field:first-child input') as HTMLInputElement;
+    // 弹窗打开后延迟聚焦第一个输入域，确保输入框可见。
+    // 定时器必须留句柄：卸载后它仍会触发，而 .modal-backdrop 是全局选择器，
+    // 可能命中别的弹窗（如连接对话框）的输入框。
+    if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current);
+    focusTimerRef.current = window.setTimeout(() => {
+      focusTimerRef.current = null;
+      if (!aliveRef.current) return;
+      const firstInput = document.querySelector(
+        '.modal-backdrop .field:first-child input',
+      ) as HTMLInputElement | null;
       if (firstInput) firstInput.focus();
     }, 100);
   };
@@ -348,13 +420,30 @@ export default function AIPanel({ sessionId, onClose }: Props) {
       setError('名称、BaseURL、模型名不能为空');
       return;
     }
+    // Number('abc') 是 NaN，会一路序列化到 IPC 里变成 null，再作为非法
+    // temperature 交给模型接口。这里直接拦下并给出明确提示。
+    const parseNum = (raw: string): number | undefined | null => {
+      if (!raw.trim()) return undefined;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+    const temperature = parseNum(editing.temperature);
+    if (temperature === null) {
+      setError('温度必须是数字');
+      return;
+    }
+    const maxTokens = parseNum(editing.maxTokens);
+    if (maxTokens === null) {
+      setError('最大 Token 数必须是数字');
+      return;
+    }
     setSaving(true);
     const config: AiConfig = {
       baseUrl,
       apiKey: editing.apiKey.trim(),
       model,
-      temperature: editing.temperature.trim() ? Number(editing.temperature) : undefined,
-      maxTokens: editing.maxTokens.trim() ? Number(editing.maxTokens) : undefined,
+      temperature,
+      maxTokens,
     };
     if (activeProfile) {
       setProfiles((ps) =>
@@ -431,13 +520,13 @@ export default function AIPanel({ sessionId, onClose }: Props) {
             </p>
           </div>
         )}
-        {messages.map((m, i) =>
+        {messages.map((m) =>
           m.role === 'user' ? (
-            <div className="ai-msg ai-msg-user" key={i}>
+            <div className="ai-msg ai-msg-user" key={m.id}>
               <div className="ai-bubble">{m.content}</div>
             </div>
           ) : (
-            <div className="ai-msg ai-msg-ai" key={i}>
+            <div className="ai-msg ai-msg-ai" key={m.id}>
               <div className={`ai-bubble${m.content === '' ? ' ai-typing' : ''}`}>
                 {m.content === '' ? '思考中…' : m.content}
               </div>

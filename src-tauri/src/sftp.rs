@@ -107,16 +107,26 @@ static CONFLICT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 例如关闭 SFTP 面板 / 切换标签导致 Tauri 调用中止），
 /// 都会把对应 request_id 从全局 map 移除，防止残留 oneshot Sender 造成内存泄漏。
 struct PendingConflictGuard<'a> {
-    map: &'a tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<ConflictChoice>>>,
+    map: &'a std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<ConflictChoice>>>,
     request_id: Option<String>,
 }
 
 impl Drop for PendingConflictGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.request_id.take() {
-            // 该锁在冲突处理中从不跨 await 持有（仅插入/移除/发送，均为瞬时操作），
-            // 此处用 blocking_lock 是安全的，不会长时间阻塞。
-            let mut map = self.map.blocking_lock();
+            // 关键：不能用 `blocking_lock()`。tokio 的实现是
+            // `block_on(self.lock())`，而 `block_on` 内部对
+            // `try_enter_blocking_region()` 做 `.expect(...)` —— 在 runtime 线程上
+            // 调用会**直接 panic**。本守卫正是在 async fn 里创建的，Drop 必然
+            // 发生在 tokio worker 线程上，因此这条路径必然炸。
+            //
+            // 本守卫在 async fn 中创建，Drop 必然发生在 tokio worker 线程上，
+            // 因此绝不能用 tokio Mutex 的 blocking_lock（内部 block_on 会对
+            // try_enter_blocking_region() 做 expect 而 panic）。AppState 里的
+            // conflict_resolvers 已改为 std::sync::Mutex，这里 lock() 是纯粹的
+            // 同步临界区（内部只有一次 HashMap remove），不会跨线程长期阻塞，
+            // 也不会 panic。
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(&id);
         }
     }
@@ -138,22 +148,32 @@ async fn open_sftp(
         conn.handle.clone()
     };
 
-    let channel = {
-        let handle = handle_arc.lock().await;
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("打开通道失败：{e}"))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| format!("请求 SFTP 子系统失败：{e}"))?;
-        channel
-    };
+    // Handle 被会话共享（终端输入 / 监控 / 端口转发都抢同一把锁），必须带超时：
+    // russh 的 channel_open_session 会等服务端应答且无内部超时，服务端收下
+    // 通道后不回包时这把锁会被无限期持有，该会话的 SFTP 与转发将全部瘫痪。
+    let channel = tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, async {
+            let handle = handle_arc.lock().await;
+            let channel = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("打开通道失败：{e}"))?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(|e| format!("请求 SFTP 子系统失败：{e}"))?;
+            Ok::<_, String>(channel)
+        })
+        .await
+        .map_err(|_| format!("打开 SFTP 子系统超时（{CHANNEL_OPEN_TIMEOUT:?}）"))??;
     SftpSession::new(channel.into_stream())
         .await
         .map_err(|e| format!("初始化 SFTP 失败：{e}"))
 }
+
+/// 打开 SSH 通道 / 请求子系统的超时。
+/// russh 侧等待服务端应答没有内部 deadline，不加限制则共享的 Handle 锁
+/// 会被异常服务器无限期持有。
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 获取远程用户的 home 目录（SFTP 默认目录）
 ///
@@ -183,27 +203,40 @@ pub async fn sftp_home(
             .ok_or_else(|| "会话不存在或已断开".to_string())?;
         conn.handle.clone()
     };
-    let mut channel = {
-        let handle = handle_arc.lock().await;
-        let chan = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("打开通道失败：{e}"))?;
-        chan.exec(true, "echo $HOME".as_bytes())
-            .await
-            .map_err(|e| format!("执行命令失败：{e}"))?;
-        chan
-    };
+    let mut channel = tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, async {
+            let handle = handle_arc.lock().await;
+            let chan = handle
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("打开通道失败：{e}"))?;
+            chan.exec(true, "echo $HOME".as_bytes())
+                .await
+                .map_err(|e| format!("执行命令失败：{e}"))?;
+            Ok::<_, String>(chan)
+        })
+        .await
+        .map_err(|_| format!("获取 HOME 目录超时（{CHANNEL_OPEN_TIMEOUT:?}）"))??;
+    // channel.wait() 没有任何超时：服务器开了 exec 却不回 EOF 时，Tauri 命令会
+    // 一直挂着，前端 await 永不结束 —— 而 sftp_home 在每次打开 SFTP 面板时都会调用。
     let mut output = Vec::new();
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                output.extend_from_slice(&data);
+    let collected = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    output.extend_from_slice(&data);
+                    if output.len() > 64 * 1024 {
+                        return Err("远程输出异常（超过 64KB）".to_string());
+                    }
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
             }
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-            Some(_) => {}
         }
-    }
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|_| "获取 home 目录超时（10 秒）".to_string())?;
+    collected?;
     let home = String::from_utf8_lossy(&output).trim().to_string();
     if home.is_empty() {
         return Err("无法获取 home 目录".to_string());
@@ -357,6 +390,15 @@ pub async fn sftp_remove(
     recursive: bool,
 ) -> Result<(), String> {
     let sftp = open_sftp(&state, &session_id).await?;
+    // 破坏性操作的服务端护栏：path 完全由前端传入，递归删除会一路展开。
+    // 没有这层检查时，一个构造出来的 "/"、"/home/user" 或用户主目录
+    // 就能被整棵删掉 —— 界面上的确认框是唯一防线，而它可以被绕过。
+    let normalized = normalize_remote_path(&path);
+    if recursive && is_dangerous_delete_target(&normalized) {
+        return Err(format!(
+            "拒绝递归删除「{normalized}」：这是用户的根目录或 home 目录，风险过高"
+        ));
+    }
     let meta = sftp
         .metadata(&path)
         .await
@@ -412,10 +454,10 @@ async fn collect_local_tree(
             } else {
                 format!("{rel}/{name}")
             };
-            // 文件数上限保护：防止超大目录全部载入内存导致 OOM
-            if files.len() >= MAX_COLLECT_FILES {
+            // 条目数上限保护（含目录）：防止超大目录全部载入内存导致 OOM
+            if files.len() + dirs.len() >= MAX_COLLECT_FILES {
                 return Err(format!(
-                    "该目录包含超过 {MAX_COLLECT_FILES} 个文件，请缩小范围后再试"
+                    "该目录包含超过 {MAX_COLLECT_FILES} 个条目，请缩小范围后再试"
                 ));
             }
             if ft.is_dir() {
@@ -435,6 +477,29 @@ async fn collect_local_tree(
         }
     }
     Ok(())
+}
+
+/// 校验远端返回的文件名是否可以安全地拼到本地路径上。
+///
+/// 只放行"单个路径分量"：不含任何分隔符（`/` 与 `\`）、不是 `.`/`..`、
+/// 不含 Windows 保留的盘符形态、也不是绝对路径。反斜杠必须显式拒绝 ——
+/// POSIX 允许 `\` 出现在文件名里，而 Windows 把它当分隔符，
+/// 这正是跨平台路径穿越的入口。
+fn is_safe_remote_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    // 形如 "C:" 的盘符 / 任何以冒号开头的绝对形式在 Windows 上都是逃逸路径
+    if name.contains(':') {
+        return false;
+    }
+    if Path::new(name).is_absolute() {
+        return false;
+    }
+    true
 }
 
 /// 递归收集远程目录结构（BFS）。
@@ -463,6 +528,14 @@ async fn collect_remote_tree(
             if name == "." || name == ".." {
                 continue;
             }
+            // 名称来自**远端服务器**，而这些相对路径最终会被 join 到本地下载目录上。
+            // POSIX 下反斜杠是合法文件名字符，所以 `..\..\evil.dll` 或
+            // `C:\Users\x\y` 完全可能从 read_dir 返回：前者能逃出本地根目录，
+            // 后者会让 Path::join 直接丢弃基路径。不做校验就等于把
+            // "远端可控内容"变成"本地任意位置写文件"。
+            if !is_safe_remote_name(&name) {
+                return Err(format!("远端目录包含非法文件名，已中止：{name}"));
+            }
             let ft = entry.file_type();
             if ft.is_symlink() {
                 continue; // 不跟随符号链接
@@ -472,10 +545,11 @@ async fn collect_remote_tree(
             } else {
                 format!("{rel}/{name}")
             };
-            // 文件数上限保护：防止超大目录全部载入内存导致 OOM
-            if files.len() >= MAX_COLLECT_FILES {
+            // 上限保护必须把 dirs 一起计入：只数 files 的话，
+            // 一个塞满空目录的树（files 始终为 0）能绕过检查把 dirs 撑爆内存。
+            if files.len() + dirs.len() >= MAX_COLLECT_FILES {
                 return Err(format!(
-                    "该目录包含超过 {MAX_COLLECT_FILES} 个文件，请缩小范围后再试"
+                    "该目录包含超过 {MAX_COLLECT_FILES} 个条目，请缩小范围后再试"
                 ));
             }
             if ft.is_dir() {
@@ -492,13 +566,78 @@ async fn collect_remote_tree(
 /// 确保远程目录存在（不存在则创建；父目录必须已存在）
 async fn ensure_remote_dir(sftp: &SftpSession, path: &str) -> Result<(), String> {
     match sftp.metadata(path).await {
+        // 远端根目录 "/"：metadata 可能不被支持而报错，但它一定是目录。
+        // 不能一律当作"不存在"去 create_dir —— 必然失败并让根目录下的
+        // 整批上传中止。
         Ok(m) if m.is_dir() => Ok(()),
+        Err(e) if is_not_found(&e) && path == "/" => Ok(()),
         Ok(_) => Err(format!("远程路径已存在且不是目录：{path}")),
-        Err(_) => sftp
-            .create_dir(path)
-            .await
-            .map_err(|e| format!("创建远程目录失败：{e}")),
+        Err(e) if !is_not_found(&e) => Err(format!("读取远程目录失败：{e}")),
+        Err(_) => match sftp.create_dir(path).await {
+            Ok(()) => Ok(()),
+            // check-then-act：确认不存在之后、真正创建之前，另一个传输
+            // 可能已经把同名目录建好了。此时 EEXIST 不是错误，复查即可。
+            Err(e) => match sftp.metadata(path).await {
+                Ok(m) if m.is_dir() => Ok(()),
+                Ok(_) => Err(format!("远程路径已存在且不是目录：{path}")),
+                Err(_) => Err(format!("创建远程目录失败：{e}")),
+            },
+        },
     }
+}
+
+/// 归一化远程路径（仅做等价规范化，不解析符号链接）
+fn normalize_remote_path(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", out.join("/"))
+    }
+}
+
+/// 判断一个路径是否是"递归删除绝不能碰"的高危目标。
+///
+/// 覆盖：根目录 `/`、以及 `/home/<user>` 或 `/Users/<user>` 这类家目录。
+/// 这几个位置被递归删除等于把整台机器的用户数据清空。
+fn is_dangerous_delete_target(normalized: &str) -> bool {
+    if normalized == "/" || normalized.is_empty() {
+        return true;
+    }
+    let segs: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() == 2 && (segs[0] == "home" || segs[0] == "Users") {
+        return true;
+    }
+    false
+}
+
+/// 拼接远程路径。base 为根 "/" 时不能产出 "//xxx"。
+#[inline]
+fn join_remote(base: &str, rel: &str) -> String {
+    if base.ends_with('/') {
+        format!("{base}{rel}")
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+/// 判断一个 SFTP 错误是否为「文件/目录不存在」。
+///
+/// russh-sftp 的 error 模块是私有的，只能按 Display 文本匹配 —— 这是该库
+/// 在不启用额外 feature 时的唯一可用手段。目的是把"确实不存在"与
+/// "权限不足 / IO 失败"区分开：前者可以安全地认为目标名空闲，后者不行。
+fn is_not_found(e: &russh_sftp::client::error::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("No such file") || msg.contains("no such file")
 }
 
 /// 生成不冲突的目标路径：`name (1).ext`、`name (2).ext`…
@@ -514,7 +653,13 @@ async fn next_available_name(
         ),
         _ => (String::new(), target.to_string()),
     };
-    let sep = if target.contains('\\') { '\\' } else { '/' };
+    // 分隔符必须取自**实际切分的位置**，而不是扫描整个路径。
+    // Linux 上的目录名里出现反斜杠是完全合法的（`/data/my\dir/file.txt`），
+    // 按 contains('\\') 判断会给这些路径拼出 `dir\name (1)` 这种错位结果。
+    let sep = match target.rfind(['/', '\\']) {
+        Some(idx) => target.as_bytes()[idx] as char,
+        None => '/',
+    };
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
         _ => (name, String::new()),
@@ -533,9 +678,20 @@ async fn next_available_name(
         } else {
             format!("{dir}{sep}{candidate}")
         };
+        // 只有"确实不存在"才算空闲。权限不足 / IO 错误不能被当成"名字可用"：
+        // 否则会返回一个随后 open 必然失败的路径，错误信息还指向一个
+        // 与真实原因无关的地方。
         let exists = match remote {
-            Some(s) => s.metadata(&full).await.is_ok(),
-            None => tokio::fs::metadata(&full).await.is_ok(),
+            Some(s) => match s.metadata(&full).await {
+                Ok(_) => true,
+                Err(e) if is_not_found(&e) => false,
+                Err(_) => true, // 无法确认 → 保守认为已占用
+            },
+            None => match tokio::fs::metadata(&full).await {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            },
         };
         if !exists {
             return Ok(full);
@@ -579,7 +735,7 @@ async fn handle_conflict(
             state
                 .conflict_resolvers
                 .lock()
-                .await
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(request_id.clone(), tx);
             let name = target
                 .rsplit(['/', '\\'])
@@ -610,7 +766,14 @@ async fn handle_conflict(
                 Ok(Ok(c)) => c,
                 _ => ConflictChoice::Skip, // 超时 / 通道断开 → 跳过
             };
-            state.conflict_resolvers.lock().await.remove(&request_id);
+            state
+                .conflict_resolvers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
+            // 解除守卫后再做任何可能失败/被取消的操作（下面 next_available_name
+            // 有网络往返）。守卫保持武装状态跨越 await 时，一旦 future 被取消，
+            // Drop 会在 runtime 线程上跑 —— 那条路径不能依赖任何加锁。
             guard.request_id = None;
             match choice {
                 ConflictChoice::Overwrite => Ok((false, target.to_string())),
@@ -664,7 +827,14 @@ async fn upload_file_core(
         .await
         .map_err(|e| format!("读取本地文件信息失败：{e}"))?
         .len();
-    let remote_meta = sftp.metadata(remote).await.ok();
+    // metadata 的错误必须区分"不存在"与"其它失败"：一律 .ok() 会让权限不足
+    // 被当成"远端文件不存在"，于是跳过冲突检测直接覆盖 —— 覆盖失败时用户
+    // 看到的却是另一个毫不相干的错误。
+    let remote_meta = match sftp.metadata(remote).await {
+        Ok(m) => Some(m),
+        Err(e) if is_not_found(&e) => None,
+        Err(e) => return Err(format!("读取远程文件信息失败：{e}")),
+    };
     let remote_size = remote_meta.as_ref().map(|m| m.len()).unwrap_or(0);
 
     // 断点续传：目标已有部分数据时直接从断点继续（不弹冲突框）
@@ -858,7 +1028,13 @@ async fn download_file_core(
         .await
         .map_err(|e| format!("获取远程文件信息失败：{e}"))?
         .len();
-    let local_meta = tokio::fs::metadata(local).await.ok();
+    // 同上：本地 metadata 只把 NotFound 当作"文件不存在"，
+    // 权限/IO 错误不能被误判为需要走冲突流程。
+    let local_meta = match tokio::fs::metadata(local).await {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("读取本地文件信息失败：{e}")),
+    };
     let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let local_str = local.to_string_lossy().to_string();
 
@@ -919,10 +1095,16 @@ async fn download_file_core(
         .await
         .map_err(|e| format!("打开远程文件失败：{e}"))?;
     let mut local_file = if resume_offset > 0 {
-        // 续传：追加模式，保留已有部分数据
+        // 续传：WRITE|CREATE 且**不带** APPEND。
+        // 用 append(true) 时写入位置永远由文件系统决定为"当前文件末尾"，
+        // 代码里的 seek 完全不起作用；而 resume_offset 是在上面 metadata()
+        // 那次网络往返之前读到的，若这期间文件被改写/增长，续传数据就会被追加到
+        // 错误的偏移上，产生内容错位/重复的损坏文件（上传路径 upload_file_core
+        // 早就为此加了打开后复校，这里是对称的漏网之处）。
         tokio::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(&actual_local)
             .await
             .map_err(|e| format!("打开本地文件失败：{e}"))?
@@ -933,10 +1115,30 @@ async fn download_file_core(
     };
 
     if resume_offset > 0 {
+        // 打开后复校实际大小：防止"检查与打开之间文件被删除/替换/截断"的竞态。
+        // 与 upload_file_core 同一套处理，只是方向相反（那边看远端，这边看本地）。
+        let actual = local_file
+            .metadata()
+            .await
+            .map_err(|e| format!("读取本地文件大小失败：{e}"))?
+            .len();
+        if actual == 0 {
+            resume_offset = 0; // 目标刚被清空：退化为从 0 开始
+        } else if actual != resume_offset {
+            if actual < remote_size {
+                resume_offset = actual; // 以实际大小为准继续
+            } else {
+                return Err("本地目标大小异常，无法续传，请移除后重试".to_string());
+            }
+        }
         remote_file
             .seek(SeekFrom::Start(resume_offset))
             .await
             .map_err(|e| format!("定位远程文件失败：{e}"))?;
+        local_file
+            .seek(SeekFrom::Start(resume_offset))
+            .await
+            .map_err(|e| format!("定位本地文件失败：{e}"))?;
         *transferred += resume_offset;
     }
 
@@ -1008,14 +1210,19 @@ async fn download_file_core(
 }
 
 /// 发送完成事件（目录传输收尾，让进度条显示 100%）
+///
+/// `transferred` 必须传真实传输量：原实现硬写 `total`，于是当用户选择"跳过"
+/// 若干同名文件时，前端仍被告知"已传输全部字节"，进度条直接满格 —— 报告的数据
+/// 与实际发生的事不符。percent 同样按真实比例计算，但只要任务整体结束就收尾。
 fn send_done(
     on_progress: &tauri::ipc::Channel<TransferProgress>,
+    transferred: u64,
     total: u64,
     total_files: u64,
     skipped: u64,
 ) {
     let _ = on_progress.send(TransferProgress {
-        transferred: total,
+        transferred,
         total,
         percent: 100.0,
         file: None,
@@ -1054,10 +1261,13 @@ pub async fn sftp_upload(
         let total: u64 = files.iter().map(|(_, s)| *s).sum();
         let total_files = files.len() as u64;
 
+        // 根目录 "/" 被 trim 成空串，后续拼出的路径会变成 "/sub/file"（少一层），
+        // 而 ensure_remote_dir("") 更是必然失败。这里保留根目录本身。
         let base = remote_path.trim_end_matches('/');
+        let base = if base.is_empty() { "/" } else { base };
         ensure_remote_dir(&sftp, base).await?;
         for d in &dirs {
-            ensure_remote_dir(&sftp, &format!("{base}/{d}")).await?;
+            ensure_remote_dir(&sftp, &join_remote(base, d)).await?;
         }
 
         let mut transferred = 0u64;
@@ -1080,7 +1290,7 @@ pub async fn sftp_upload(
             )
             .await?;
         }
-        send_done(&on_progress, total, total_files, skipped);
+        send_done(&on_progress, transferred, total, total_files, skipped);
     } else {
         // ---- 单个文件 ----
         let total = meta.len();
@@ -1147,13 +1357,15 @@ pub async fn sftp_download(
         let total_files = files.len() as u64;
 
         let base = remote_path.trim_end_matches('/');
+        // 同上：base 为空表示远端根目录
+        let base = if base.is_empty() { "/" } else { base };
         let mut transferred = 0u64;
         let mut files_done = 0u64;
         for (rel, _) in &files {
             download_file_core(
                 state.inner(),
                 &sftp,
-                &format!("{base}/{rel}"),
+                &join_remote(base, rel),
                 &local_root.join(rel),
                 rel,
                 &on_progress,
@@ -1167,7 +1379,7 @@ pub async fn sftp_download(
             )
             .await?;
         }
-        send_done(&on_progress, total, total_files, skipped);
+        send_done(&on_progress, transferred, total, total_files, skipped);
     } else {
         // ---- 单个文件 ----
         let total = meta.len();
@@ -1205,9 +1417,88 @@ pub async fn sftp_resolve_conflict(
     request_id: String,
     action: ConflictChoice,
 ) -> Result<(), String> {
-    let mut resolvers = state.conflict_resolvers.lock().await;
+    let mut resolvers = state
+        .conflict_resolvers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = resolvers.remove(&request_id) {
-        let _ = tx.send(action);
+        if tx.send(action).is_err() {
+            // 接收端（传输任务）已经不在了：传输被取消或超时结束。
+            // 静默丢弃即可，但值得留痕以便排查。
+            eprintln!("[sftp] 冲突 {request_id} 的接收端已消失，选择未被消费");
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_path_traversal_names() {
+        // 反斜杠在 POSIX 下是合法文件名字符，但落到 Windows 上就是分隔符，
+        // 这是把"远端可控名字"变成"本地任意位置写文件"的入口，必须拒绝。
+        assert!(!is_safe_remote_name(r"..\..\..\Windows\System32\evil.dll"));
+        assert!(!is_safe_remote_name(".."));
+        assert!(!is_safe_remote_name("."));
+        assert!(!is_safe_remote_name(""));
+        assert!(!is_safe_remote_name("a/b"));
+        assert!(!is_safe_remote_name(r"a\b"));
+        assert!(!is_safe_remote_name(r"C:\Users\x\y"));
+        assert!(!is_safe_remote_name("C:evil"));
+    }
+
+    #[test]
+    fn accepts_ordinary_names() {
+        assert!(is_safe_remote_name("report.pdf"));
+        assert!(is_safe_remote_name("中文文件名.txt"));
+        assert!(is_safe_remote_name("a.b.c"));
+        assert!(is_safe_remote_name("..hidden"));
+        assert!(is_safe_remote_name("file..name"));
+    }
+
+    #[test]
+    fn blocks_dangerous_recursive_delete_targets() {
+        assert!(is_dangerous_delete_target("/"));
+        assert!(is_dangerous_delete_target("/home/alice"));
+        assert!(is_dangerous_delete_target("/Users/bob"));
+        // 带 .. 的绕过写法：调用方（sftp_remove）会先做规范化，
+        // 这里验证规范化之后确实被拦住
+        assert!(is_dangerous_delete_target(&normalize_remote_path("/home/../home/alice")));
+        assert!(is_dangerous_delete_target(&normalize_remote_path("/./")));
+        // 正常目录不应被拦
+        assert!(!is_dangerous_delete_target("/home"));
+        assert!(!is_dangerous_delete_target("/home/alice/project"));
+        assert!(!is_dangerous_delete_target("/var/log"));
+        assert!(!is_dangerous_delete_target("/Users"));
+    }
+
+    #[test]
+    fn normalize_remote_path_resolves_dot_segments() {
+        assert_eq!(normalize_remote_path("/a/b/../c"), "/a/c");
+        assert_eq!(normalize_remote_path("/a//b/"), "/a/b");
+        assert_eq!(normalize_remote_path("/a/./b"), "/a/b");
+        assert_eq!(normalize_remote_path("/.."), "/");
+        assert_eq!(normalize_remote_path("/"), "/");
+        assert_eq!(normalize_remote_path("/home/alice/../.."), "/");
+    }
+
+    #[test]
+    fn join_remote_never_doubles_slash() {
+        assert_eq!(join_remote("/", "a/b.txt"), "/a/b.txt");
+        assert_eq!(join_remote("/home", "a/b.txt"), "/home/a/b.txt");
+        assert_eq!(join_remote("/home/", "a.txt"), "/home/a.txt");
+    }
+
+    #[test]
+    fn remote_root_is_not_trimmed_away() {
+        // 回归：trim_end_matches('/') 会把 "/" 变成 ""，
+        // 导致 ensure_remote_dir("") 失败、下载路径少一层。
+        let trimmed = "/".trim_end_matches('/');
+        assert_eq!(trimmed, "");
+        let base = if trimmed.is_empty() { "/" } else { trimmed };
+        assert_eq!(base, "/");
+        assert_eq!(join_remote(base, "x.txt"), "/x.txt");
+    }
 }

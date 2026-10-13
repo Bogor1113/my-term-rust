@@ -2,9 +2,13 @@ import ReactDOM from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <App />,
-);
+// 容错：id 缺失时给出明确报错，而不是让 react-dom 抛
+// "Target container is not a DOM element" 这种难以定位的异常
+const rootEl = document.getElementById("root");
+if (!rootEl) {
+  throw new Error('找不到挂载节点 #root（index.html 可能被破坏）');
+}
+ReactDOM.createRoot(rootEl).render(<App />);
 
 // 窗口默认隐藏（visible: false），等界面就绪后再显示，彻底避免 WebView2 启动白屏。
 // 注意：不能用 requestAnimationFrame——隐藏窗口的 rAF 在 Chromium 中会被暂停；

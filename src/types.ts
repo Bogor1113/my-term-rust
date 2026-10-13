@@ -75,6 +75,14 @@ export interface ForwardInfo {
 export interface AiMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  /**
+   * 稳定 id。仅用于 React 的 key。
+   *
+   * 不能用数组下标：超出 MAX_MESSAGES 时会从**头部**裁剪（旧消息先被丢弃），
+   * 下标整体前移，React 会把旧 DOM 节点复用到另一条消息上 —— 包括正在流式
+   * 输出的最后一条（updateLastAssistant 按"最后一条"定位）。
+   */
+  id: string;
 }
 
 // 模型调用配置（OpenAI 兼容接口）

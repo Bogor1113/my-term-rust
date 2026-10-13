@@ -200,7 +200,25 @@ body::before {
     repeating-linear-gradient(0deg, var(--amb-line-faint) 0 1px, transparent 1px 14px),
     repeating-linear-gradient(90deg, var(--amb-line-faint) 0 1px, transparent 1px 14px),
     var(--bg);
-  animation: ambient-breathe 8s ease-in-out infinite;
+  /* 这里刻意**没有**呼吸动画（原先是 `ambient-breathe 8s infinite`）。
+   实测（24 核机器 / 空载 / 界面上没有任何会话）：
+
+     保持动画            ≈ 0.70 个 CPU 核
+     仅做合成层提升      ≈ 0.28 个 CPU 核
+     动画完全去掉        ≈ 0.15 个 CPU 核
+
+   两个叠加的原因：
+   ① 这一层铺满视口且叠了 11 个渐变（5 个 radial + 6 个网格 repeating-linear），
+      不提升图层的话 Chromium 每帧都要重新栅格化整屏；
+   ② 它下方压着 28 处 backdrop-filter（磨砂玻璃质感）。只要这层的不透明度
+      每帧变化，Chromium 就必须对每个毛玻璃区域重新做背景模糊与合成。
+
+   而它的视觉效果只是 8 秒一个来回、幅度 0.85→1.0 的不透明度变化，
+   透过半透明面板几乎看不出 —— 拿常驻 4~5 倍的 CPU 换一个不可感知的呼吸感，
+   不划算。下面的 layer 提升仍然保留：切主题时整层重绘一次远比逐帧便宜。 */
+  will-change: opacity;
+  transform: translateZ(0);
+  contain: paint;
 }
 
 /* 噪点纹理覆盖层：模拟真实磨砂玻璃的微颗粒感 */
@@ -216,15 +234,21 @@ body::after {
   mix-blend-mode: overlay;
 }
 
-@keyframes ambient-breathe {
-  0%, 100% { opacity: 0.85; }
-  50% { opacity: 1; }
-}
+/* 注：原先的 @keyframes ambient-breathe 已随循环动画一并移除（见上方说明），
+   在此保留其定义以备需要时快速恢复：
+   @keyframes ambient-breathe { 0%,100% { opacity:.85 } 50% { opacity:1 } }
+   body::before { animation: ambient-breathe 8s ease-in-out infinite; }
+*/
 
-/* 无障碍：系统开启"减少动态效果"时，关闭背景呼吸动画 */
+/* 无障碍：系统开启"减少动态效果"时，关闭所有纯装饰性的循环动画。
+   这些动画没有任何信息量（呼吸 / 脉冲），关掉不影响功能，
+   对前庭敏感用户也更友好，同时显著降低常驻 CPU 开销。 */
 @media (prefers-reduced-motion: reduce) {
-  body::before {
-    animation: none;
+  body::before,
+  .empty-logo,
+  .field input:focus,
+  .cluster-badge .pulse-dot {
+    animation: none !important;
   }
 }
 
@@ -1308,6 +1332,11 @@ textarea:focus-visible {
   margin-bottom: 8px;
   filter: drop-shadow(0 0 14px rgba(79, 140, 255, 0.55));
   animation: empty-breathe 3.2s ease-in-out infinite;
+  /* 该元素带 drop-shadow 滤镜，且在"没有任何会话"时长期可见（即应用刚启动的
+     常态）。不做图层提升的话，不透明度动画每帧都要重新计算一次滤镜。
+     提升后滤镜只栅格化一次，动画交给合成器。 */
+  will-change: opacity;
+  transform: translateZ(0);
 }
 
 .empty-state h1 {
@@ -1322,14 +1351,17 @@ textarea:focus-visible {
 }
 
 @keyframes empty-breathe {
+  /* 只动 opacity，不动 transform。
+     .empty-logo 上挂着 drop-shadow 滤镜，而 transform 变化会连带要求滤镜
+     每帧重新计算；仅透明度变化则可以完全交给合成器。
+     同时该元素在"没有任何会话"时长期可见（即应用刚启动的常态），
+     这里的每帧开销是长期存在的，不是瞬时尖峰。 */
   0%,
   100% {
     opacity: 0.85;
-    transform: scale(1);
   }
   50% {
     opacity: 1;
-    transform: scale(1.05);
   }
 }
 

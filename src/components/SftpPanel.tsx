@@ -251,6 +251,14 @@ export default function SftpPanel({
   const loadSeqRef = useRef(0);
   // 是否已发生过 cd 导航（避免挂载时 home 加载覆盖 cd 目标）
   const navLoadedRef = useRef(false);
+  // 组件是否仍然存活：在卸载后置 false，供在途传输的进度回调 / finally 自查
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
 
   const keepRefs = (p: string, ts: ActiveTransfer[]) => {
     pathRef.current = p;
@@ -286,6 +294,11 @@ export default function SftpPanel({
   //   面板停留在旧标签的目录内容，而不是加载新标签的 home）
   useEffect(() => {
     navLoadedRef.current = false;
+    // 清空上一台主机的目录视图：面板随 activeTab 复用不重挂载，
+    // 不重置的话用户会先看到上一台服务器的目录，等新 load() 返回才跳走。
+    setEntries([]);
+    setPath('/');
+    setError('');
   }, [tab.id]);
 
   // 初次挂载：获取 home 并上报；若无待处理的 cd 导航则进入 home
@@ -469,14 +482,20 @@ export default function SftpPanel({
             ],
       );
       const onProgress = (p: TransferProgress) => {
+        // 面板已卸载 / 标签已切换：继续写 state 无意义，
+        // 并且 finally 里的 load() 会给一个已离开的会话发新的 sftpList。
+        if (aliveRef.current === false) return;
         setT((ts) => ts.map((t) => (t.key === key ? { ...t, progress: p } : t)));
         // 同名冲突：加入队列逐个弹出处理（后端传输任务挂起等待回复）
         if (p.conflict) {
           const c = p.conflict;
-          setConflictQueue((q) => [
-            ...q,
-            { requestId: c.requestId, name: c.name, path: c.path },
-          ]);
+          // 去重：后端在挂起期间仍会持续推送带 conflict 的进度帧，
+          // 不去重会让同一个 requestId 在队列里堆叠、弹窗反复重开。
+          setConflictQueue((q) =>
+            q.some((i) => i.requestId === c.requestId)
+              ? q
+              : [...q, { requestId: c.requestId, name: c.name, path: c.path }],
+          );
         }
       };
       let ok = false;
@@ -498,7 +517,7 @@ export default function SftpPanel({
         );
       } finally {
         runningKeysRef.current.delete(key);
-        if (ok) {
+        if (ok && aliveRef.current !== false) {
           if (type === 'download') {
             // 下载完成：保留传输项显示"已完成"，可打开所在文件夹 / 移除
             setT((ts) =>
@@ -541,12 +560,14 @@ export default function SftpPanel({
 
   // 回复传输冲突处理方式（overwrite/skip/rename/overwrite_all/skip_all/cancel）
   const resolveConflict = (action: string) => {
-    setConflictQueue((q) => {
-      const [head, ...rest] = q;
-      if (head) {
-        void sftpResolveConflict(head.requestId, action).catch(() => {});
-      }
-      return rest;
+    const head = conflictQueue[0];
+    if (!head) return;
+    // 注意：不要把 IPC 调用塞进 setState 的 updater 里。updater 必须是纯函数，
+    // React 在 StrictMode 下会故意调用两次来做开发期校验 —— 那样后端会收到
+    // 两条相同 requestId 的冲突回复，传输按第一个决定执行、第二个静默丢弃。
+    setConflictQueue((q) => q.slice(1));
+    void sftpResolveConflict(head.requestId, action).catch((e) => {
+      setError(`处理冲突失败：${String(e)}`);
     });
   };
 
@@ -576,15 +597,31 @@ export default function SftpPanel({
     [runUpload],
   );
 
+  // 对话框插件的 open/save 会 reject（scope 错误、对话框已打开、权限不足等）。
+  // 这些函数都是从 onClick 以 void 调起的，没有 await 也没有 catch，
+  // 任何一次失败都会变成完全没有反馈的 unhandledrejection。
+  const runDialog = async <T,>(fn: () => Promise<T>): Promise<T | null> => {
+    try {
+      return await fn();
+    } catch (e) {
+      setError(`文件对话框失败：${String(e)}`);
+      return null;
+    }
+  };
+
   const uploadDialog = async () => {
-    const picked = await open({ multiple: true, directory: false, title: '选择要上传的文件' });
+    const picked = await runDialog(() =>
+      open({ multiple: true, directory: false, title: '选择要上传的文件' }),
+    );
     if (!picked) return;
     const files = Array.isArray(picked) ? picked : [picked];
     await uploadPaths(files);
   };
 
   const uploadDirDialog = async () => {
-    const picked = await open({ multiple: true, directory: true, title: '选择要上传的文件夹' });
+    const picked = await runDialog(() =>
+      open({ multiple: true, directory: true, title: '选择要上传的文件夹' }),
+    );
     if (!picked) return;
     const dirs = Array.isArray(picked) ? picked : [picked];
     await uploadPaths(dirs);
@@ -606,11 +643,13 @@ export default function SftpPanel({
       // recursive: true 必须显式传入 —— dialog 插件在选中目录时会执行
       // allow_directory(path, recursive) 把该目录写入 fs scope；缺省 false 时
       // 仅授权目录本身而不含子项，递归写入会被 scope 拦下。
-      const picked = await open({
-        directory: true,
-        recursive: true,
-        title: `选择保存位置（将下载整个文件夹「${entry.name}」）`,
-      });
+      const picked = await runDialog(() =>
+        open({
+          directory: true,
+          recursive: true,
+          title: `选择保存位置（将下载整个文件夹「${entry.name}」）`,
+        }),
+      );
       if (!picked) return;
       const dir = Array.isArray(picked) ? picked[0] : picked;
       if (!dir) return;
@@ -621,7 +660,9 @@ export default function SftpPanel({
       await runDownload(entry, target);
       return;
     }
-    const dest = await save({ defaultPath: entry.name, title: '保存到本地' });
+    const dest = await runDialog(() =>
+      save({ defaultPath: entry.name, title: '保存到本地' }),
+    );
     if (!dest) return;
     await runDownload(entry, dest);
   };
@@ -651,15 +692,21 @@ export default function SftpPanel({
     if (entry.isDir) {
       // 先检查文件夹是否为空，非空时给出递归删除警示确认
       let count = -1;
+      let readFailed = false;
       try {
         count = (await sftpList(tab.id, entry.path)).length;
-      } catch {
-        /* 忽略：无法读取时按可能非空处理 */
+      } catch (e) {
+        // 读不到目录时不能默默按"可能非空"推进：这是破坏性操作，
+        // 必须在提示里如实说明状态未确认。
+        readFailed = true;
+        setError(`无法读取目录「${entry.name}」：${String(e)}`);
       }
       msg =
         count === 0
           ? `确定删除空文件夹「${entry.name}」吗？此操作不可撤销。`
-          : `文件夹「${entry.name}」${count > 0 ? `，其中包含 ${count} 个项目` : '（可能包含内容）'}，将递归删除整个文件夹及其全部内容，此操作不可撤销。确定删除吗？`;
+          : readFailed
+            ? `文件夹「${entry.name}」无法读取（权限不足或已被移除），将按递归删除整个目录处理，此操作不可撤销。确定删除吗？`
+            : `文件夹「${entry.name}」，其中包含 ${count} 个项目，将递归删除整个文件夹及其全部内容，此操作不可撤销。确定删除吗？`;
       recursive = true;
     } else {
       msg = `确定删除文件「${entry.name}」吗？此操作不可撤销。`;

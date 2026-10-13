@@ -1,7 +1,7 @@
 // ---------- 类型、导入等 ----------
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
-import type { IDecoration, ITerminalOptions } from 'xterm';
+import type { IDecoration, ILink, ITerminalOptions } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -108,7 +108,13 @@ const HIGHLIGHT_RULES: {
   },
 ];
 
-export default function TerminalTab({
+/**
+ * 用 memo 包裹：App 在每一次 cd 导航、标签点击、分屏拖拽时都会整体重渲染，
+ * 而 TerminalTab 内部维护着 xterm 实例与大量 ref。props 里的 tab 对象由
+ * tabs 数组派生、仅在标签增删改时变化，配合稳定的 broadcastTargets 引用，
+ * 绝大多数重渲染可以在这里被挡掉。
+ */
+const TerminalTab = memo(function TerminalTab({
   tab,
   active,
   hidden = false,
@@ -159,6 +165,7 @@ export default function TerminalTab({
   // 手动重连冷却：防止连续点击「重试」触发连接风暴
   const [retryCooldown, setRetryCooldown] = useState(0);
   const lastManualRetryRef = useRef(0);
+  const retryTimerRef = useRef<number | null>(null);
   // ---------- 输出缓冲背压：防止高速输出导致 xterm 内部缓冲无限增长 ----------
   // 后端已将数据合并为低频大消息，这里再按帧节流写入 xterm，并丢弃积压旧数据。
   const MAX_PENDING_BYTES = 2 * 1024 * 1024; // 待写入缓冲上限 2MB
@@ -174,6 +181,12 @@ export default function TerminalTab({
   const setStatusSafe = (s: Status) => {
     if (!disposedRef.current) setStatus(s);
   };
+  // 错误状态同样要防卸载后写 state（connect 的 catch 分支可能晚于清理函数执行）
+  const setErrorSafe = (e: string) => {
+    if (!disposedRef.current) setError(e);
+  };
+  // 连接代次：每次 connect 自增，用于丢弃上一轮 channel / connect 的迟到回调
+  const genRef = useRef(0);
 
   // 把一段输出写入 xterm，并对其尾部做 cd 回显检测（只处理最新 64KB，避免逐帧解析开销）
   const flushPending = () => {
@@ -194,6 +207,13 @@ export default function TerminalTab({
       off += c.length;
     }
 
+    // 先判活：processOutput 内部会触发 onCwdChange → App.setNavReq，
+    // 若此时组件已卸载，会给一个已经关闭的标签发起 SFTP 目录请求。
+    if (disposedRef.current) {
+      flushingRef.current = false;
+      return;
+    }
+
     // 输出回显 cd 检测（兜底信号）：只解析最新 64KB，避免高频输出拖慢解析
     if (merged.length > 0) {
       const tailLen = Math.min(merged.length, 64 * 1024);
@@ -208,6 +228,13 @@ export default function TerminalTab({
     }
     let pos = 0;
     const writeNext = () => {
+      // xterm 的 WriteBuffer 在 dispose() 后不会清空待写队列，已排队的回调仍会继续触发。
+      // 不提前退出的话，卸载后残余数据会被解析进已销毁的缓冲区，浪费 CPU 且让
+      // flushingRef 永久停在 true。
+      if (disposedRef.current || !termRef.current) {
+        flushingRef.current = false;
+        return;
+      }
       if (pos >= merged.length) {
         // 写入完成才释放「刷新中」锁，避免并发写链
         flushingRef.current = false;
@@ -248,7 +275,8 @@ export default function TerminalTab({
       pendingSizeRef.current > MAX_PENDING_BYTES &&
       pendingBufRef.current.length > 0
     ) {
-      const dropped = pendingBufRef.current.shift()!;
+      const dropped = pendingBufRef.current.shift();
+      if (!dropped) break;
       pendingSizeRef.current -= dropped.length;
     }
     scheduleFlush();
@@ -258,6 +286,11 @@ export default function TerminalTab({
   const refreshHighlights = () => {
     const term = termRef.current;
     if (!term || disposedRef.current) return;
+    // 不可见的终端跳过：隐藏面板用的是 visibility:hidden，盒子仍在，
+    // 所以 viewportY/rows 都读得到，但这份全视口正则扫描 + marker/装饰
+    // 重建对用户完全不可见。开 5 个标签就等于每 120ms 白扫 5 遍。
+    const el = containerRef.current;
+    if (el && el.offsetParent === null && !activeRef.current) return;
     for (const d of hlDecorationsRef.current) {
       try {
         d.dispose();
@@ -308,12 +341,18 @@ export default function TerminalTab({
   const fitTerminal = useCallback(() => {
     const term = termRef.current;
     const fit = fitRef.current;
-    if (!term || !fit) return;
+    if (!term || !fit || disposedRef.current) return;
+    const before = `${term.cols}x${term.rows}`;
     try {
       fit.fit();
-      void resizePty(tab.id, term.cols, term.rows).catch(() => {});
     } catch {
-      /* 容器暂不可见时忽略 */
+      return; // 容器暂不可见时忽略
+    }
+    // 只有尺寸真的变了才发 IPC。
+    // addon-fit 在元素缺失/零尺寸时是静默早退（返回 undefined 而非抛异常），
+    // 旧代码无条件发 resize_pty，分隔条拖拽时这等于每秒几十次无意义往返。
+    if (`${term.cols}x${term.rows}` !== before) {
+      void resizePty(tab.id, term.cols, term.rows).catch(() => {});
     }
   }, [tab.id]);
 
@@ -321,12 +360,14 @@ export default function TerminalTab({
   const sendToRemote = useCallback(
     (b64: string) => {
       const targets = broadcastRef.current;
-      if (targets.length > 0) {
-        for (const id of targets) {
-          void sendInput(id, b64).catch(() => {});
-        }
-      } else {
-        void sendInput(tab.id, b64).catch(() => {});
+      const list = targets.length > 0 ? targets : [tab.id];
+      for (const id of list) {
+        // 会话不存在（已断开/被重连顶替）时后端返回错误。此前这里被完全吞掉，
+        // 表现就是"终端突然不再响应任何输入"而界面毫无提示 —— 无法诊断。
+        void sendInput(id, b64).catch((e) => {
+          console.warn(`[TerminalTab] 发送输入失败（${id}）：`, e);
+          if (id === tab.id) setStatusSafe('closed');
+        });
       }
     },
     [tab.id],
@@ -440,6 +481,12 @@ export default function TerminalTab({
       window.clearTimeout(reconnectRef.current.timer);
       reconnectRef.current.timer = null;
     }
+    // 代次自增：本次 connect 之后到达的**任何**旧回调（上一个 channel 的
+    // data / close、上一轮 connect 的 then / catch）都必须被丢弃。
+    // 后端也已拒绝重复 session_id，若前端不做隔离就会退化成
+    // "旧连接的事件把新连接标成 closed 并触发新一轮重连"的抖动。
+    const myGen = ++genRef.current;
+    const isCurrent = () => myGen === genRef.current;
     setError('');
     setStatusSafe('connecting');
     echoBufRef.current = '';
@@ -448,6 +495,9 @@ export default function TerminalTab({
 
     // 安排下一次重连：1s → 2s → 4s → 8s → 封顶 10s
     const scheduleNext = () => {
+      // 卸载后不得再排定时器：那会调用 connect()，而组件的清理函数已经跑完，
+      // 这个 timer 再也不会被清掉 —— 一个能在标签关闭后不断重连的后台定时器。
+      if (disposedRef.current || !isCurrent()) return;
       const n = reconnectRef.current.attempts + 1;
       reconnectRef.current.attempts = n;
       setReconnectAttempts(n);
@@ -460,13 +510,21 @@ export default function TerminalTab({
     };
 
     connectSsh(tab, term.cols, term.rows, (ev) => {
-      if (disposedRef.current) return;
+      if (disposedRef.current || !isCurrent()) return;
       if (ev.type === 'data') {
         setStatusSafe('connected');
         reconnectRef.current.attempts = 0;
         setReconnecting(false);
-        const bytes = base64ToBytes(ev.data);
-        enqueueOutput(bytes); // 入队缓冲，由 rAF 背压节流后写入 xterm
+        // base64 帧来自网络，必须容错：atob 遇到畸形输入会抛，
+        // 而这里处于 Tauri 的 Channel 回调里，异常不会被任何 catch 兜住。
+        try {
+          const bytes = base64ToBytes(ev.data);
+          enqueueOutput(bytes); // 入队缓冲，由 rAF 背压节流后写入 xterm
+        } catch {
+          /* 忽略畸形帧 */
+        }
+      } else if (ev.type === 'error') {
+        setErrorSafe(ev.data);
       } else {
         setStatusSafe('closed');
         // shell 正常退出（exit）不自动重连；网络断开 / 远端关闭通道则重连
@@ -475,8 +533,9 @@ export default function TerminalTab({
       }
     })
       .then(() => {
-        if (disposedRef.current) {
-          // 组件已卸载但连接此刻才建立完成 → 立即断开，避免会话泄漏
+        if (disposedRef.current || !isCurrent()) {
+          // 组件已卸载或已被新一轮连接取代，但连接此刻才建立完成
+          // → 立即断开，避免会话泄漏
           void disconnectSsh(tab.id).catch(() => {});
           return;
         }
@@ -489,7 +548,8 @@ export default function TerminalTab({
           .catch(() => {});
       })
       .catch((err) => {
-        setError(String(err));
+        if (disposedRef.current || !isCurrent()) return;
+        setErrorSafe(String(err));
         setStatusSafe('error');
         // 处于自动重连周期中时继续退避重试；首次连接失败则停止（显示手动重试）
         if (reconnectRef.current.attempts > 0) {
@@ -508,8 +568,12 @@ export default function TerminalTab({
     if (elapsed < MANUAL_RETRY_COOLDOWN) {
       const remain = Math.ceil((MANUAL_RETRY_COOLDOWN - elapsed) / 1000);
       setRetryCooldown(remain);
-      // 冷却结束后清除倒计时
-      window.setTimeout(() => setRetryCooldown(0), MANUAL_RETRY_COOLDOWN - elapsed);
+      // 冷却结束后清除倒计时（存句柄以便卸载时清理，否则会对已卸载组件 setState）
+      if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = window.setTimeout(() => {
+        retryTimerRef.current = null;
+        setRetryCooldown(0);
+      }, MANUAL_RETRY_COOLDOWN - elapsed);
       return;
     }
     lastManualRetryRef.current = now;
@@ -558,19 +622,30 @@ export default function TerminalTab({
     termRef.current = term;
     fitRef.current = fit;
     searchRef.current = search;
+    // rendererType 是未被类型系统覆盖的运行时选项（见上方注释）。
+    // 若将来升级的 xterm 重命名或移除了它，会静默回退到 canvas 渲染器 ——
+    // 恰好复现当初要规避的"WebView2 下 ANSI 颜色不绘制"问题。
+    // 这里显式确认一次，让退化在控制台留痕而不是变成难以定位的现象。
+    if ((term.options as { rendererType?: string }).rendererType !== 'dom') {
+      console.warn(
+        '[TerminalTab] xterm 未采用 DOM 渲染器（rendererType=' +
+          String((term.options as { rendererType?: string }).rendererType) +
+          '），部分环境可能出现 ANSI 颜色异常',
+      );
+    }
     term.open(container);
 
     // URL 超链接点击（http/https/ftp）：直接调用系统默认浏览器打开
     const urlRegex = /(https?:\/\/[^\s<>"']+|ftp:\/\/[^\s<>"']+)/g;
     term.registerLinkProvider({
-      provideLinks(bufferLineNumber: number, callback: (links: any) => void) {
+      provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
         const line = term.buffer.active.getLine(bufferLineNumber);
         if (!line) {
           callback(undefined);
           return;
         }
         const lineStr = line.translateToString(true);
-        const links: { range: any; text: string; activate: () => void }[] = [];
+        const links: ILink[] = [];
         let m: RegExpExecArray | null;
         urlRegex.lastIndex = 0;
         while ((m = urlRegex.exec(lineStr)) !== null) {
@@ -603,15 +678,25 @@ export default function TerminalTab({
     container.addEventListener('keydown', onKey);
 
     // 左键选中 → 自动复制到系统剪贴板
-    term.onSelectionChange(() => {
+    // 节流：onSelectionChange 在 shift+方向键逐字符扩选、以及选区收缩为空的
+    // 过程中都会触发。原实现每次都写一次系统剪贴板，等于每次按键都惊动 OS。
+    let lastCopied = '';
+    let copyTimer: number | null = null;
+    const selDisposable = term.onSelectionChange(() => {
       const sel = term.getSelection();
-      if (sel) {
-        void writeText(sel).catch(() => {});
-      }
+      if (!sel || sel === lastCopied) return;
+      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      copyTimer = window.setTimeout(() => {
+        copyTimer = null;
+        lastCopied = sel;
+        void writeText(sel).catch((e) => {
+          console.warn('[TerminalTab] 写入剪贴板失败：', e);
+        });
+      }, 250);
     });
 
     // 滚动 → 重建可见行高亮
-    term.onScroll(() => scheduleHighlightRefresh());
+    const scrollDisposable = term.onScroll(() => scheduleHighlightRefresh());
 
     // 右键 → 直接粘贴（不弹出右键菜单）
     const onCtx = (e: MouseEvent) => {
@@ -698,6 +783,7 @@ export default function TerminalTab({
 
     // Ctrl + 滚轮 → 放大/缩小字体（阻止浏览器整页缩放与终端缓冲滚动）
     // 用捕获阶段监听：在 xterm 视口处理滚轮之前拦截
+    let wheelRaf: number | null = null;
     const onWheel = (e: WheelEvent) => {
       if (!e.ctrlKey) return;
       e.preventDefault();
@@ -717,28 +803,56 @@ export default function TerminalTab({
         /* 存储失败时忽略 */
       }
       // 字号变化后重新适配并同步远端 PTY 尺寸
-      requestAnimationFrame(() => fitTerminal());
+      // 合帧：Ctrl+滚轮快速缩放时每次 wheel 都会排一个 rAF，
+      // 密集滚动能堆出几十个待执行回调。
+      if (wheelRaf !== null) cancelAnimationFrame(wheelRaf);
+      wheelRaf = requestAnimationFrame(() => {
+        wheelRaf = null;
+        fitTerminal();
+      });
     };
     container.addEventListener('wheel', onWheel, { passive: false, capture: true });
 
     // 容器尺寸变化 → 适配（分屏时左右面板均需按各自宽度重新适配，
     // 因此不再依赖 active，仅在有实际尺寸时适配；display:none 无盒子不会触发）
+    // 用 rAF 合帧：拖动分屏分隔条时 ResizeObserver 每帧触发数次，
+    // 直接透传等于每秒几十次 resize_pty 往返。
+    let fitRaf: number | null = null;
     const ro = new ResizeObserver(() => {
-      if (container.clientWidth > 0 && container.clientHeight > 0) fitTerminal();
+      if (fitRaf !== null) return;
+      fitRaf = requestAnimationFrame(() => {
+        fitRaf = null;
+        if (disposedRef.current) return;
+        if (container.clientWidth > 0 && container.clientHeight > 0) fitTerminal();
+      });
     });
     ro.observe(container);
 
-    requestAnimationFrame(() => {
+    const mountRaf = requestAnimationFrame(() => {
       fitTerminal();
       connect();
     });
 
     return () => {
       disposedRef.current = true;
+      if (fitRaf !== null) cancelAnimationFrame(fitRaf);
+      cancelAnimationFrame(mountRaf);
+      if (copyTimer !== null) window.clearTimeout(copyTimer);
+      try {
+        selDisposable.dispose();
+        scrollDisposable.dispose();
+      } catch {
+        /* 忽略 */
+      }
       // 卸载时清理自动重连定时器
       if (reconnectRef.current.timer !== null) {
         window.clearTimeout(reconnectRef.current.timer);
         reconnectRef.current.timer = null;
+      }
+      // 清理重试冷却定时器
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
       }
       // 清理高亮定时器与装饰
       if (hlTimerRef.current !== null) {
@@ -988,4 +1102,6 @@ export default function TerminalTab({
       )}
     </div>
   );
-}
+});
+
+export default TerminalTab;

@@ -66,6 +66,14 @@ async fn exec_remote(
             match channel.wait().await {
                 Some(ChannelMsg::Data { data }) => {
                     output_buf.extend_from_slice(&data);
+                    // 上限保护：异常/恶意服务器可以在 exec 通道上无限输出，
+                    // 没有这个闸门会一路吃到 OOM。
+                    if output_buf.len() > MAX_REMOTE_OUTPUT {
+                        return Err(format!(
+                            "远程命令输出超过 {}KB，已中止",
+                            MAX_REMOTE_OUTPUT / 1024
+                        ));
+                    }
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                 Some(_) => {}
@@ -79,6 +87,11 @@ async fn exec_remote(
         .await
         .map_err(|_| "远程命令执行超时".to_string())?
 }
+
+/// 单次远程 exec 输出的字节上限（1MB）。
+/// 采集命令输出固定在几 KB 量级，留两个数量级余量即可；
+/// 上限存在的意义是防止异常/恶意服务器用无限输出把进程吃到 OOM。
+const MAX_REMOTE_OUTPUT: usize = 1024 * 1024;
 
 /// 在远程服务器上采集一次系统数据
 /// 通过 exec 通道运行 shell 命令并解析输出
@@ -199,13 +212,16 @@ fn parse_stats_macos(text: &str, host: &str, session_id: &str) -> Result<RemoteS
                 .and_then(|v| v.trim().parse::<f64>().ok())
         })
     };
-    let cpu1_idle = parse_cpu_idle("CPU1").unwrap_or(100.0);
-    let cpu2_idle = parse_cpu_idle("CPU2").unwrap_or(100.0);
-    // 取后一次采样计算使用率；两次都失败则视为 0
-    let cpu_percent = if cpu2_idle < 100.0 || cpu1_idle < 100.0 {
-        (100.0 - cpu2_idle).clamp(0.0, 100.0)
-    } else {
-        0.0
+    let cpu1_idle = parse_cpu_idle("CPU1");
+    let cpu2_idle = parse_cpu_idle("CPU2");
+    // 取后一次采样计算使用率。
+    // 注意不能给缺失值兜 100.0：只解析到 CPU1 时旧写法算成 100.0 - 100.0 = 0%，
+    // 会把一台满载的机器显示成 0% CPU。这里改为"优先用 CPU2，缺失才退回 CPU1，
+    // 两者都缺失才按 0 处理"。
+    let cpu_percent = match (cpu2_idle, cpu1_idle) {
+        (Some(idle2), _) => (100.0 - idle2).clamp(0.0, 100.0),
+        (None, Some(idle1)) => (100.0 - idle1).clamp(0.0, 100.0),
+        (None, None) => 0.0,
     };
 
     // 内存：top 输出 "PhysMem: 15G used (4255M wired), 17G unused."
@@ -285,7 +301,11 @@ fn split_sections(text: &str) -> HashMap<&str, String> {
     let mut current_section = "";
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("---") && trimmed.ends_with("---") {
+        // 必须先卡长度：starts_with/ends_with 对 "---"/"----"/"-----" 这类
+        // 3~5 个连字符的短行同样成立，此时 [3..len-3] 的起点会大于终点 → panic。
+        // 远端 `df`/`free` 输出里出现纯横线行并非不可能，不能让一条数据
+        // 把整个监控任务打挂。
+        if trimmed.len() >= 7 && trimmed.starts_with("---") && trimmed.ends_with("---") {
             let name = &trimmed[3..trimmed.len() - 3];
             if name != "DONE" && name != "SLEEP" {
                 current_section = name;
@@ -488,7 +508,15 @@ pub fn start_session_monitor(app: &AppHandle, session_id: &str, mut cancel_rx: t
                         let _ = app.emit(&format!("session-sys-info-{sid}"), &info);
                     }
                     Err(e) => {
-                        eprintln!("[monitor-{sid}] 采集失败：{e}");
+                        let msg = e.to_string();
+                        eprintln!("[monitor-{sid}] 采集失败：{msg}");
+                        // "会话不存在"说明会话已被移除（断开/被新连接顶替），
+                        // 而不是网络抖动。计入连续失败会让重连后的新会话
+                        // 在几轮内被误杀，监控彻底失效 —— 直接退出本轮任务。
+                        if msg.contains("会话不存在") {
+                            eprintln!("[monitor-{sid}] 会话已不存在，停止监控");
+                            break;
+                        }
                         consecutive_failures += 1;
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                             // 连续多次失败，连接大概率已断开，停止监控
@@ -503,6 +531,14 @@ pub fn start_session_monitor(app: &AppHandle, session_id: &str, mut cancel_rx: t
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 _ = cancel_rx.changed() => {
+                    // Err = 发送端已被 drop（会话重连时被新 Sender 顶替）。
+                    // 此时值恒为初始的 false，不 break 就会跳过下面的 2 秒 sleep，
+                    // 退化成无延迟死循环 —— 而循环体每轮都可能打 2 条远程 exec，
+                    // 足以把远端服务器淹没。必须在这里退出。
+                    if cancel_rx.changed().await.is_err() {
+                        eprintln!("[monitor-{sid}] 取消信号发送端已消失，停止监控");
+                        break;
+                    }
                     if *cancel_rx.borrow_and_update() {
                         break;
                     }
@@ -536,4 +572,56 @@ pub async fn set_monitor_session(
 ) -> Result<(), String> {
     *state.monitor_visible.lock().await = session_id;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_dash_lines_do_not_panic() {
+        // 回归：旧实现只判断 starts_with("---") && ends_with("---")，
+        // 于是 "---"(len 3)、"----"(len 4)、"-----"(len 5) 都会走进
+        // &trimmed[3..len-3]，起点大于终点 → panic，
+        // 一条纯横线数据就能把整个远程监控任务打挂。
+        for line in ["---", "----", "-----", "------"] {
+            let mut sections = HashMap::new();
+            let mut cur = "";
+            let trimmed = line;
+            if trimmed.len() >= 7
+                && trimmed.starts_with("---")
+                && trimmed.ends_with("---")
+            {
+                cur = &trimmed[3..trimmed.len() - 3];
+            }
+            if !cur.is_empty() {
+                sections.insert(cur, String::new());
+            }
+            assert!(sections.is_empty(), "{line} should not produce a section");
+        }
+    }
+
+    #[test]
+    fn split_sections_parses_real_markers() {
+        let text = "---CPU1---\ncpu 1 2 3\n---DONE---\n";
+        let s = split_sections(text);
+        assert!(s.contains_key("CPU1"));
+        assert!(!s.contains_key("DONE"));
+        assert!(s["CPU1"].contains("cpu 1 2 3"));
+    }
+
+    #[test]
+    fn split_sections_tolerates_malformed_input() {
+        // 不得 panic
+        let _ = split_sections("---\n----\n-----\n-------\n--------\n");
+        let _ = split_sections("");
+        let _ = split_sections("no markers at all");
+    }
+
+    #[test]
+    fn split_sections_handles_cjk_marker() {
+        let s = split_sections("--- 指标 ---\n值\n");
+        // 带空格的标记：名称是 " 指标 "，含首尾空格但内容正确
+        assert!(s.keys().any(|k| k.contains("指标")));
+    }
 }

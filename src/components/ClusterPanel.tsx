@@ -532,6 +532,15 @@ export default function ClusterPanel({
   // 请求序号：并发请求时丢弃旧响应，防止旧数据覆盖新数据（竞态闪烁）
   const svcSeqRef = useRef(0);
   const hdfsSeqRef = useRef(0);
+  const yarnSeqRef = useRef(0);
+  // 组件是否存活：所有 loadXxx 的 await 都可能在卸载后才 resolve
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   // HDFS 分页（大目录避免一次性渲染万级 DOM）
   const [hdfsPage, setHdfsPage] = useState(0);
   const HDFS_PAGE_SIZE = 100;
@@ -582,7 +591,7 @@ export default function ClusterPanel({
         clusterYarnNodes(sessionId),
       ]);
       // 已有更新的请求发出，丢弃本次过期结果（收尾交给那一次请求）
-      if (seq !== svcSeqRef.current) return;
+      if (seq !== svcSeqRef.current || !mountedRef.current) return;
       if (svc.status === 'fulfilled') {
         setServices(svc.value);
         setSvcError('');
@@ -635,7 +644,7 @@ export default function ClusterPanel({
       // 否则：手动刷新（loadAll）被 15s 自动刷新（loadLight）取代时，上面那句
       // return 会跳过收尾，loading 永远停在 true → 刷新按钮变成永久禁用的
       // "加载中…"（这是"手动刷新失灵"的根因）。
-      if (seq === svcSeqRef.current) setLoading(false);
+      if (seq === svcSeqRef.current && mountedRef.current) setLoading(false);
     }
   }, [sessionId]);
 
@@ -658,7 +667,7 @@ export default function ClusterPanel({
         clusterYarnNodes(sessionId),
       ]);
       // 已有更新的请求发出，丢弃本次过期结果（收尾交给那一次请求）
-      if (seq !== svcSeqRef.current) return;
+      if (seq !== svcSeqRef.current || !mountedRef.current) return;
       if (svc.status === 'fulfilled') {
         setServices(svc.value);
         setSvcError('');
@@ -701,22 +710,27 @@ export default function ClusterPanel({
       }
     } finally {
       // 自己是最后一次请求时负责解除加载态（被 loadAll 取代时由 loadAll 收尾）
-      if (seq === svcSeqRef.current) setLoading(false);
+      if (seq === svcSeqRef.current && mountedRef.current) setLoading(false);
     }
   }, [sessionId]);
 
   // 仅刷新 YARN 任务列表（独立刷新按钮）
   const loadYarn = useCallback(async () => {
+    // 与 loadHdfs 同样的序号防竞态：刷新按钮的 disabled 状态要等下一次渲染
+    // 才生效，同一帧内的双击会发出两次请求，迟到的旧响应会覆盖新数据。
+    const seq = ++yarnSeqRef.current;
     setYarnLoading(true);
     try {
       const apps = await clusterYarnApps(sessionId);
+      if (seq !== yarnSeqRef.current || !mountedRef.current) return;
       setYarnApps(apps);
       setYarnError('');
     } catch (e) {
+      if (seq !== yarnSeqRef.current || !mountedRef.current) return;
       setYarnApps([]);
       setYarnError(String(e));
     } finally {
-      setYarnLoading(false);
+      if (seq === yarnSeqRef.current && mountedRef.current) setYarnLoading(false);
     }
   }, [sessionId]);
 
@@ -727,21 +741,21 @@ export default function ClusterPanel({
       setHdfsLoading(true);
       try {
         const entries = await clusterHdfsList(sessionId, path, force);
-        if (seq !== hdfsSeqRef.current) return; // 过期响应丢弃（快速连续切换目录时）
+        if (seq !== hdfsSeqRef.current || !mountedRef.current) return; // 过期响应丢弃（快速连续切换目录时）
         setHdfsPath(path);
         setHdfsEntries(entries);
         setHdfsPage(0); // 切换目录后回到第一页
         setHdfsInput(path === '/' ? '' : path);
         setHdfsError('');
       } catch (e) {
-        if (seq !== hdfsSeqRef.current) return;
+        if (seq !== hdfsSeqRef.current || !mountedRef.current) return;
         // HDFS 不可用（未启动/未就绪/权限）：区域内显示真实原因，不弹顶部错误条
         setHdfsEntries([]);
         setHdfsPage(0);
         const msg = String(e).trim();
         setHdfsError(msg.length > 60 ? `${msg.slice(0, 57)}…` : (msg || 'HDFS 不可用'));
       } finally {
-        if (seq === hdfsSeqRef.current) setHdfsLoading(false);
+        if (seq === hdfsSeqRef.current && mountedRef.current) setHdfsLoading(false);
       }
     },
     [sessionId],
@@ -798,7 +812,9 @@ export default function ClusterPanel({
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
-    if (autoRefresh && active) {
+    // splitPane 与可见性判定保持一致：分屏右面板的集群标签 active 恒为 false，
+    // 只按 active 判断会让一个用户正在盯着看的面板永远不自动刷新。
+    if (autoRefresh && (active || splitPane)) {
       timerRef.current = window.setInterval(() => void loadLight(), 15000);
     }
     return () => {
@@ -807,7 +823,7 @@ export default function ClusterPanel({
         timerRef.current = null;
       }
     };
-  }, [autoRefresh, active, loadLight]);
+  }, [autoRefresh, active, splitPane, loadLight]);
 
   // 切回前台时立即补刷一次（仅在自动刷新开启时有意义）
   const wasActiveRef = useRef(active);
@@ -891,14 +907,15 @@ export default function ClusterPanel({
       message: `确定要终止 YARN 应用 ${app.name}（${app.id}）吗？该操作不可恢复。`,
       busyText: '终止中…',
       run: async () => {
-        const ok = await withBusy(`kill:${app.id}`, () => clusterYarnKill(sessionId, app.id), (msg) => {
-          setError(msg);
-          void loadLight();
-        });
-        if (ok) {
-          setError('');
-          void loadLight();
-        }
+        // 结果走 showNotice 而不是顶部 error 条：那个条不会自动消失，
+        // 一次失败会让红色告警常驻，直到用户碰巧触发别的成功操作。
+        const ok = await withBusy(
+          `kill:${app.id}`,
+          () => clusterYarnKill(sessionId, app.id),
+          (msg) => showNotice('error', msg),
+        );
+        if (ok) showNotice('ok', `已终止 ${app.id}`);
+        void loadLight();
         return ok ? `已终止 ${app.id}` : '';
       },
     });
@@ -1166,9 +1183,9 @@ export default function ClusterPanel({
                   ) : (
                     hdfsEntries
                       .slice(hdfsPage * HDFS_PAGE_SIZE, (hdfsPage + 1) * HDFS_PAGE_SIZE)
-                      .map((e, i) => (
+                      .map((e) => (
                       <tr
-                        key={`${e.path}-${i}`}
+                        key={e.path}
                         className={e.is_dir ? 'cluster-hdfs-dir' : undefined}
                         onClick={e.is_dir ? () => enterDir(e) : undefined}
                         title={e.is_dir ? `进入 ${e.path}` : e.path}
