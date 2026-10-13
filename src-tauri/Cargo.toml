@@ -1,6 +1,6 @@
 [package]
 name = "myterm"
-version = "1.0.44"
+version = "1.0.45"
 description = "MyTerm - 跨平台远程 SSH 终端工具，集成 SFTP 文件管理与系统资源监控"
 authors = ["MyTerm"]
 edition = "2021"
