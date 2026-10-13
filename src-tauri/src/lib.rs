@@ -113,6 +113,38 @@ impl Default for AppState {
     }
 }
 
+/// 窗口的 WebView2 附加启动参数（对应 tauri.conf.json 的 additionalBrowserArgs）。
+///
+/// **修改时必须同步改 tauri.conf.json** —— 配置才是真正生效的地方，这里只做留档。
+///
+/// 两个要点：
+///
+/// 1. 为什么必须原样保留 `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
+///    wry 源码 `webview2/mod.rs` 里：
+///    ```ignore
+///    let additional_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
+///        let default_args = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+///        ...
+///    });
+///    ```
+///    只有在 `additional_browser_args` 为 `None` 时才会拼接这串默认值。
+///    一旦我们显式设置了整个字符串，wry 就**完全不再添加**自己的默认参数 ——
+///    漏掉的话会连带恢复迷你菜单(msWebOOUI) 与 SmartScreen 拦截(msSmartScreenProtection)。
+///
+/// 2. 关于 crashpad
+///    `--disable-breakpad` 对应 Chromium `base/base_switches.h` 里的 `kDisableBreakpad`
+///    ("disable-breakpad"，注释为 "Disables the crash reporting")，作用是不再生成
+///    minidump、不向 Watson 端点上传。
+///
+///    但要说清楚：WebView2 **没有**提供彻底移除 crashpad 子进程的官方开关 ——
+///    MicrosoftEdge/WebView2Feedback#4966 至今仍是未关闭的 feature request，
+///    `IsCustomCrashReportingEnabled` 也只是改变 dump 去向，并不会阻止该进程启动。
+///    因此这里能做到的是"不产生 dump、不外传"，而非"不拉起进程"。
+///    典型收益：此前每次渲染/GPU 进程崩溃都会在
+///    `%LOCALAPPDATA%\\com.myterm.app\\EBWebView\\Crashpad\\reports\\` 落下约 7MB 的 .dmp。
+#[cfg(windows)]
+pub const WEBVIEW2_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-breakpad --disable-crash-reporter";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()

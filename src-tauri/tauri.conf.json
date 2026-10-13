@@ -21,7 +21,8 @@
         "decorations": false,
         "shadow": true,
         "visible": false,
-        "devtools": false
+        "devtools": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-breakpad --disable-crash-reporter"
       }
     ],
     "security": {
