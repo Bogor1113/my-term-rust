@@ -1,7 +1,7 @@
 // ---------- 类型、导入等 ----------
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
-import type { IDecoration, ILink, ITerminalOptions } from 'xterm';
+import type { ILink, IMarker, ITerminalOptions } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -174,8 +174,16 @@ const TerminalTab = memo(function TerminalTab({
   const pendingSizeRef = useRef(0); // 待写入总字节数
   const flushingRef = useRef(false); // 是否正在执行 rAF 刷新
   const needReflushRef = useRef(false); // 刷新期间又来了新数据，需再刷一次
-  // 关键词高亮：当前活动装饰集 + 防抖定时器
-  const hlDecorationsRef = useRef<Set<IDecoration>>(new Set());
+  // 关键词高亮：当前活动 marker 集 + 防抖定时器。
+  // 注意存的是 marker 而非 decoration。这是「用 10 分钟后界面卡死」的根因修复：
+  // xterm 在 registerDecoration 内部只建立了 marker.onDispose(() => deco.dispose())
+  // —— 即 marker 销毁会级联销毁装饰，但反过来 dispose 装饰**不会**销毁 marker。
+  // 旧实现只追踪装饰、刷新时只 dispose 装饰，于是每次刷新新建的 marker 永久残留
+  // 在 term 内部 markers 数组里，且每个 marker 都注册了 lines.onTrim 回调。
+  // 滚动条每溢出一次（超 scrollback=6000 行）就对全部累积 marker 逐个回调，
+  // 流式日志几分钟就堆到上万 marker → 每次 trim 二次方劣化 → 越用越卡。
+  // 这里改为追踪 marker，刷新/卸载时 dispose marker，由它级联清理装饰。
+  const hlMarkersRef = useRef<IMarker[]>([]);
   const hlTimerRef = useRef<number | null>(null);
 
   const setStatusSafe = (s: Status) => {
@@ -291,14 +299,16 @@ const TerminalTab = memo(function TerminalTab({
     // 重建对用户完全不可见。开 5 个标签就等于每 120ms 白扫 5 遍。
     const el = containerRef.current;
     if (el && el.offsetParent === null && !activeRef.current) return;
-    for (const d of hlDecorationsRef.current) {
+    // dispose 旧 marker（级联销毁其装饰）。只 dispose 装饰是不够的 —— 见
+    // hlMarkersRef 上方注释：marker 不会随之释放，会持续累积导致卡顿。
+    for (const mk of hlMarkersRef.current) {
       try {
-        d.dispose();
+        mk.dispose();
       } catch {
         /* 忽略 */
       }
     }
-    hlDecorationsRef.current.clear();
+    hlMarkersRef.current = [];
     const buf = term.buffer.active;
     const start = buf.viewportY;
     const end = Math.min(start + term.rows, buf.length);
@@ -313,7 +323,9 @@ const TerminalTab = memo(function TerminalTab({
         let m: RegExpExecArray | null;
         while ((m = rule.regex.exec(text)) !== null) {
           const marker = term.registerMarker(row - cursorAbs);
-          const deco = term.registerDecoration({
+          // registerDecoration 在 marker 已销毁时早退返回 undefined；正常路径会在
+          // 内部建立 marker.onDispose(() => deco.dispose()) 的单向级联。
+          term.registerDecoration({
             marker,
             x: m.index,
             width: m[0].length,
@@ -321,7 +333,8 @@ const TerminalTab = memo(function TerminalTab({
             backgroundColor: rule.bg,
             foregroundColor: rule.fg,
           });
-          if (deco) hlDecorationsRef.current.add(deco);
+          // 追踪 marker：刷新/卸载时 dispose 它即可连带释放装饰
+          hlMarkersRef.current.push(marker);
           if (m.index === rule.regex.lastIndex) rule.regex.lastIndex++;
         }
       }
@@ -854,19 +867,19 @@ const TerminalTab = memo(function TerminalTab({
         window.clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
-      // 清理高亮定时器与装饰
+      // 清理高亮定时器与 marker（级联释放装饰；见 hlMarkersRef 注释）
       if (hlTimerRef.current !== null) {
         window.clearTimeout(hlTimerRef.current);
         hlTimerRef.current = null;
       }
-      for (const d of hlDecorationsRef.current) {
+      for (const mk of hlMarkersRef.current) {
         try {
-          d.dispose();
+          mk.dispose();
         } catch {
           /* 忽略 */
         }
       }
-      hlDecorationsRef.current.clear();
+      hlMarkersRef.current = [];
       ro.disconnect();
       container.removeEventListener('wheel', onWheel);
       container.removeEventListener('contextmenu', onCtx);
