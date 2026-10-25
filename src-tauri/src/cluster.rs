@@ -1160,7 +1160,11 @@ fn log_source(key: &str) -> (&str, &str) {
     match key {
         "HDFS" => ("/opt/hadoop3/logs", "hadoop-root-namenode-*.log"),
         "YARN" => ("/opt/hadoop3/logs", "hadoop-root-resourcemanager-*.log"),
-        "Hive" => ("/tmp/root", "hive.log"),
+        // start_cmd 用 nohup 把 metastore / hiveserver2 的 stdout+stderr 重定向到
+        // /tmp/hive-{metastore,hiveserver2}.log；`ls -t` 取最新的那一个。
+        // 原先写 /tmp/root/hive.log 是本环境实测不存在的（2026-10-25 修复），
+        // 导致 Hive 明明在跑、点"日志"却显示"暂无日志"。
+        "Hive" => ("/tmp", "hive-*.log"),
         "DolphinScheduler" => ("/tmp", "dolphinscheduler-standalone.log"),          // daemon.sh 的 start/stop 输出都落此文件；standalone-server-*.out 仅运行期 stdout
         "MySQL" => ("/var/log/mysql", "error.log"),
         "SparkMaster" => ("/opt/spark2/logs", "spark-*.log"),
@@ -3114,5 +3118,30 @@ mod tests {
         assert!(!ClusterManager::port_verified_in_cmd("HDFS"));
         assert!(!ClusterManager::port_verified_in_cmd("YARN"));
         assert!(!ClusterManager::port_verified_in_cmd("MySQL"));
+    }
+
+    /// log_source 指向的日志路径必须**真实存在**（实测 192.168.42.101）。
+    /// 修复记录：Hive 原先写 `/tmp/root/hive.log`（不存在），导致服务在跑却显示
+    /// "暂无日志"；start_cmd 实际用 nohup 重定向到 `/tmp/hive-{metastore,hiveserver2}.log`。
+    #[test]
+    fn log_source_hive_points_to_real_nohup_redirect_paths() {
+        let (path, pattern) = log_source("Hive");
+        // 修复前的错误值（必须不再出现）
+        assert_ne!(path, "/tmp/root", "Hive 日志路径不能是 /tmp/root（实测不存在）");
+        assert_ne!(pattern, "hive.log", "Hive 日志 pattern 不能是 hive.log（实测不存在）");
+        // 修复后的正确值：start_cmd 用 nohup > /tmp/hive-{metastore,hiveserver2}.log
+        assert_eq!(path, "/tmp");
+        assert!(pattern.starts_with("hive-"), "Hive 日志 pattern 应匹配 hive-*.log");
+        assert!(pattern.contains("*"), "Hive 日志 pattern 应为通配符");
+    }
+
+    /// 其余服务的日志路径不能是空串（否则 ls -t "" 会报错）。
+    #[test]
+    fn log_source_never_returns_empty_path_or_pattern() {
+        for key in ["HDFS", "YARN", "Hive", "DolphinScheduler", "MySQL", "SparkMaster", "SparkWorker"] {
+            let (path, pattern) = log_source(key);
+            assert!(!path.is_empty(), "{key} 日志路径为空");
+            assert!(!pattern.is_empty(), "{key} 日志 pattern 为空");
+        }
     }
 }
