@@ -44,7 +44,7 @@ interface LogReq {
   loading: boolean;
 }
 
-const SERVICE_KEYS = ['HDFS', 'YARN', 'Hive', 'DolphinScheduler', 'MySQL', 'SparkMaster', 'SparkWorker'];
+const SERVICE_KEYS = ['MySQL', 'HDFS', 'YARN', 'Hive', 'DolphinScheduler', 'SparkMaster', 'SparkWorker'];
 
 /** 操作动作的中文文案 */
 const actionText = (a: ServiceAction): string =>

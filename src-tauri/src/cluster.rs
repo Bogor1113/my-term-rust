@@ -140,7 +140,23 @@ fn filter_meaningful_ports(raw: &str) -> String {
 
 /// 全部 7 个服务定义。
 fn get_service_configs() -> Vec<ServiceConfig> {
+    // 启动顺序：MySQL（基础设施）→ HDFS（存储）→ YARN（资源调度）→ Hive（SQL）→ DolphinScheduler（调度）
+    // → Spark（计算）。界面展示与后端缓存刷新均按此顺序，保证用户按依赖关系操作。
     vec![
+        ServiceConfig {
+            key: "MySQL",
+            name: "MySQL",
+            web_port: 3306,
+            web_path: "",
+            // pgrep -x mysqld：精确匹配进程名（不用 -f 模糊匹配 cmdline），
+            // 不会误中 mariadbd/含 mysqld 字样的其他进程。
+            check_cmd: "pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'; systemctl status mysql 2>/dev/null | head -2 1>&2 || service mysql status 2>/dev/null | head -2 1>&2".to_string(),
+            start_cmd: format!("{}sudo systemctl start mysql 2>/dev/null || sudo service mysql start 2>/dev/null; pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'", SOURCE),
+            stop_cmd: format!("{}sudo systemctl stop mysql 2>/dev/null || sudo service mysql stop 2>/dev/null; pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'", SOURCE),
+            // MySQL 支持原子重启（systemctl restart 同步完成，无需 stop 再 start 两步）。
+            restart_cmd: Some(format!("{}sudo systemctl restart mysql 2>/dev/null || sudo service mysql restart 2>/dev/null; pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'", SOURCE)),
+            port_cmd: port_cmd("[m]ysqld"),
+        },
         ServiceConfig {
             key: "HDFS",
             name: "HDFS",
@@ -220,20 +236,6 @@ fn get_service_configs() -> Vec<ServiceConfig> {
             stop_cmd: format!("{}bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh stop standalone-server; sleep 5", SOURCE),
             restart_cmd: None,
             port_cmd: port_cmd("[o]rg.apache.dolphinscheduler.StandaloneServer|[d]olphinscheduler-standalone-server"),
-        },
-        ServiceConfig {
-            key: "MySQL",
-            name: "MySQL",
-            web_port: 3306,
-            web_path: "",
-            // pgrep -x mysqld：精确匹配进程名（不用 -f 模糊匹配 cmdline），
-            // 不会误中 mariadbd/含 mysqld 字样的其他进程。
-            check_cmd: "pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'; systemctl status mysql 2>/dev/null | head -2 1>&2 || service mysql status 2>/dev/null | head -2 1>&2".to_string(),
-            start_cmd: format!("{}sudo systemctl start mysql 2>/dev/null || sudo service mysql start 2>/dev/null; pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'", SOURCE),
-            stop_cmd: format!("{}sudo systemctl stop mysql 2>/dev/null || sudo service mysql stop 2>/dev/null; pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'", SOURCE),
-            // MySQL 支持原子重启（systemctl restart 同步完成，无需 stop 再 start 两步）。
-            restart_cmd: Some(format!("{}sudo systemctl restart mysql 2>/dev/null || sudo service mysql restart 2>/dev/null; pgrep -x mysqld > /dev/null 2>&1 && echo 'running' || echo 'stopped'", SOURCE)),
-            port_cmd: port_cmd("[m]ysqld"),
         },
         ServiceConfig {
             key: "SparkMaster",
