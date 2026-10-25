@@ -195,9 +195,9 @@ fn get_service_configs() -> Vec<ServiceConfig> {
             name: "Hive",
             web_port: 10002,
             web_path: "",
-            // 精确匹配完整 Java 主类 + 端口监听双重确认（HiveMetaStore:9083 / HiveServer2:10000），
-            // 避免其他命令行含 "hive" 字样的进程导致误报运行中
-            check_cmd: "pgrep -f '[o]rg.apache.hadoop.hive.metastore.HiveMetaStore' >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':9083 ' && echo 'metastore:alive' || echo 'metastore:dead'; pgrep -f '[o]rg.apache.hive.service.server.HiveServer2' >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':10000 ' && echo 'hiveserver2:alive' || echo 'hiveserver2:dead'".to_string(),
+            // 精确匹配完整 Java 主类 + 端口监听双重确认（HiveMetaStore:9083 / HiveServer2:10000 / WebUI:10002），
+            // 三个端口全部就绪才算 Running——只等 metastore+hiveserver2 会提前返回，WebUI 还没起来。
+            check_cmd: "pgrep -f '[o]rg.apache.hadoop.hive.metastore.HiveMetaStore' >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':9083 ' && echo 'metastore:alive' || echo 'metastore:dead'; pgrep -f '[o]rg.apache.hive.service.server.HiveServer2' >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':10000 ' && echo 'hiveserver2:alive' || echo 'hiveserver2:dead'; ss -tln 2>/dev/null | grep -q ':10002 ' && echo 'webui:alive' || echo 'webui:dead'".to_string(),
             // </dev/null 断开 stdin：SSH exec 通道关闭时后台 JVM 不因收到 EOF 异常退出。
             start_cmd: format!(
                 "{}nohup /opt/hive3/bin/hive --service metastore </dev/null > /tmp/hive-metastore.log 2>&1 & sleep 2; nohup /opt/hive3/bin/hive --service hiveserver2 </dev/null > /tmp/hive-hiveserver2.log 2>&1 &",
@@ -542,9 +542,10 @@ impl ClusterManager {
             "Hive" => {
                 let meta_alive = stdout.contains("metastore:alive");
                 let hs2_alive = stdout.contains("hiveserver2:alive");
-                if meta_alive && hs2_alive {
+                let webui_alive = stdout.contains("webui:alive");
+                if meta_alive && hs2_alive && webui_alive {
                     ClusterServiceStatus::Running
-                } else if meta_alive || hs2_alive {
+                } else if meta_alive || hs2_alive || webui_alive {
                     ClusterServiceStatus::Degraded
                 } else {
                     ClusterServiceStatus::Stopped
@@ -3106,17 +3107,21 @@ mod tests {
             ClusterManager::parse_status("YARN", "rm:dead nm:0"),
             ClusterServiceStatus::Stopped
         );
-        // Hive：两个子组件都要在
+        // Hive：三个子组件都要在（metastore:9083 / hiveserver2:10000 / webui:10002）
         assert_eq!(
-            ClusterManager::parse_status("Hive", "metastore:alive hiveserver2:alive"),
+            ClusterManager::parse_status("Hive", "metastore:alive hiveserver2:alive webui:alive"),
             ClusterServiceStatus::Running
+        );
+        assert_eq!(
+            ClusterManager::parse_status("Hive", "metastore:alive hiveserver2:alive webui:dead"),
+            ClusterServiceStatus::Degraded
         );
         assert_eq!(
             ClusterManager::parse_status("Hive", "metastore:alive hiveserver2:dead"),
             ClusterServiceStatus::Degraded
         );
         assert_eq!(
-            ClusterManager::parse_status("Hive", "metastore:dead hiveserver2:dead"),
+            ClusterManager::parse_status("Hive", "metastore:dead hiveserver2:dead webui:dead"),
             ClusterServiceStatus::Stopped
         );
         // 单进程服务
