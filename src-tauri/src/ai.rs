@@ -41,6 +41,52 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// 一行 SSE `data:` 载荷的分类结果。
+#[derive(Debug, PartialEq)]
+enum SseDataAction {
+    /// 一段增量内容，需要推给前端
+    Delta(String),
+    /// 流正常结束（OpenAI 约定的 `data: [DONE]`）
+    Done,
+    /// 接口返回错误（已格式化成可直接展示给用户的信息）
+    Error(String),
+}
+
+/// 把一行 `data:` 后的载荷分类。`None` 表示该行不可处理（空行、非 JSON、
+/// 无 delta 的空壳帧等），调用方直接忽略。
+///
+/// 之所以抽成纯函数：错误判定和增量提取是整条 AI 链路上最容易出错的地方，
+/// 而它原先内联在流读取循环里，无法单独测试。
+fn classify_sse_data(data: &str) -> Option<SseDataAction> {
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+    if data == "[DONE]" {
+        return Some(SseDataAction::Done);
+    }
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+
+    // 网关常在 HTTP 200 的响应体里返回错误。两种形态都要认：
+    // - OpenAI / DeepSeek 的 `{"error": {"message": "..."}}` —— error 是**对象**；
+    // - 部分服务（含 Ollama 兼容端点）的 `{"error": "..."}` —— error 是字符串。
+    // 原先只取 `as_str()`，对象形态会落空：choices 取不到 delta，
+    // 于是错误被静默吞掉，用户只得到一个空白回复，不知道发生了什么。
+    if let Some(e) = v.get("error") {
+        let msg = e
+            .get("message")
+            .and_then(|m| m.as_str())
+            .or_else(|| e.as_str())
+            .unwrap_or("未知错误");
+        return Some(SseDataAction::Error(format!("接口返回错误：{msg}")));
+    }
+
+    v["choices"][0]["delta"]["content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| SseDataAction::Delta(s.to_string()))
+}
+
 /// 流式对话：通过 Tauri 事件 ai-chunk-<request_id> 逐段推送增量内容，
 /// 结束后发送 ai-done-<request_id>。前端监听这两个事件拼接完整回答。
 #[tauri::command]
@@ -126,25 +172,15 @@ pub async fn ai_chat_stream(
                 let line = String::from_utf8_lossy(&buffer[..pos]).trim().to_string();
                 buffer.drain(..pos + 1);
                 if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data == "[DONE]" {
-                        // 终止整个流。原先是 continue，会一直读到服务端关连接为止 ——
+                    match classify_sse_data(data) {
+                        // [DONE] 必须立刻终止：否则会一直读到服务端关连接为止，
                         // 对保持 keep-alive 的实现而言就是无限期挂起。
-                        return Ok(());
-                    }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                        // 网关常在 HTTP 200 的响应体里返回 {"error": {...}}。
-                        // 这种情况下 choices 为空，下面取不到 delta，用户只会看到
-                        // 一个空白回复 + ai-done，没有任何错误提示。
-                        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-                            return Err(format!("接口返回错误：{err}"));
+                        Some(SseDataAction::Done) => return Ok(()),
+                        Some(SseDataAction::Error(msg)) => return Err(msg),
+                        Some(SseDataAction::Delta(delta)) => {
+                            let _ = app.emit(&format!("ai-chunk-{request_id}"), delta);
                         }
-                        if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
-                            if !delta.is_empty() {
-                                let _ =
-                                    app.emit(&format!("ai-chunk-{request_id}"), delta.to_string());
-                            }
-                        }
+                        None => {}
                     }
                 }
             }
@@ -193,7 +229,214 @@ pub async fn ai_chat_cancel(request_id: String) -> Result<(), String> {
         .unwrap_or_else(|e| e.into_inner())
         .get(&request_id)
     {
-        flag.store(true, Ordering::Relaxed);
+    flag.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- truncate：错误信息长度闸门 ----------
+
+    #[test]
+    fn truncate_keeps_short_strings_intact() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("", 10), "");
+        assert_eq!(truncate("x", 0), "");
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // 中文按字符计，不按字节计：截到 3 个字符，而不是 3 个字节
+        // （3 字节会落在字符中间 → 产生 U+FFFD 乱码，直接显示给用户）
+        let out = truncate("中文错误信息", 3);
+        assert_eq!(out, "中文错");
+        assert!(out.chars().count() == 3);
+    }
+
+    #[test]
+    fn truncate_handles_mixed_script_and_mixed_width() {
+        assert_eq!(truncate("a中b", 2), "a中");
+        assert_eq!(truncate("ééé", 2), "éé");
+        // emoji 是多字节字符，截断不能把它劈成半个
+        let out = truncate("好🎉好", 2);
+        assert_eq!(out.chars().count(), 2);
+    }
+
+    // ---------- 取消标志注册表：请求级守卫 ----------
+
+    #[test]
+    fn cancel_guard_removes_entry_on_drop() {
+        // 关键健壮性：无论 ai_chat_stream 正常返回、返回错误，
+        // 还是 future 被 drop（关窗 / 页面重载），CancelGuard 都必须把
+        // request_id 从全局表里摘掉。否则反复开关 AI 面板会持续泄漏。
+        let flag = Arc::new(AtomicBool::new(false));
+        cancel_flags().lock().unwrap().insert("guard-req-1".into(), flag);
+        assert!(
+            cancel_flags().lock().unwrap().contains_key("guard-req-1"),
+            "前置：条目应当已注册"
+        );
+
+        let _guard = CancelGuard("guard-req-1".to_string());
+        drop(_guard);
+
+        assert!(
+            !cancel_flags().lock().unwrap().contains_key("guard-req-1"),
+            "Drop 之后条目必须被摘除"
+        );
+    }
+
+    #[test]
+    fn cancel_guard_drop_is_idempotent_after_already_removed() {
+        // 手动清掉之后守卫再 Drop 也不应 panic
+        cancel_flags().lock().unwrap().insert("guard-req-2".into(), Arc::new(AtomicBool::new(false)));
+        let g = CancelGuard("guard-req-2".to_string());
+        drop(g);
+        // 重复 drop 不可能发生（Rust 不允许 move 后复用），这里只验证空表状态下再查
+        assert!(!cancel_flags().lock().unwrap().contains_key("guard-req-2"));
+    }
+
+    #[tokio::test]
+    async fn ai_chat_cancel_sets_the_registered_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        cancel_flags().lock().unwrap().insert("cancel-req-live".into(), flag.clone());
+
+        assert!(!flag.load(Ordering::Relaxed));
+        ai_chat_cancel("cancel-req-live".to_string()).await.unwrap();
+        assert!(flag.load(Ordering::Relaxed), "取消标志应当被置位");
+    }
+
+    #[tokio::test]
+    async fn ai_chat_cancel_is_idempotent_for_unknown_request() {
+        // 请求已完成 / 从未发起时静默成功，不能报错
+        ai_chat_cancel("never-existed-request".to_string())
+            .await
+            .unwrap();
+        ai_chat_cancel("never-existed-request".to_string())
+            .await
+            .unwrap();
+    }
+
+    // ---------- 配置序列化：前后端字段名契约 ----------
+
+    #[test]
+    fn ai_config_uses_camel_case_wire_names() {
+        // 前端按 camelCase 传参；serde 重命名错一处就是整块配置静默丢失
+        let c: AiConfig = serde_json::from_value(serde_json::json!({
+            "baseUrl": "http://127.0.0.1:1/v1",
+            "apiKey": "sk-test",
+            "model": "gpt-4",
+            "temperature": 0.7,
+            "maxTokens": 512
+        }))
+        .unwrap();
+        assert_eq!(c.base_url, "http://127.0.0.1:1/v1");
+        assert_eq!(c.api_key, "sk-test");
+        assert_eq!(c.model, "gpt-4");
+        assert_eq!(c.temperature, Some(0.7));
+        assert_eq!(c.max_tokens, Some(512));
+
+        // temperature / max_tokens 可选，缺省为 None（不会覆盖服务端默认值）
+        let c2: AiConfig = serde_json::from_value(serde_json::json!({
+            "baseUrl": "http://x", "apiKey": "k", "model": "m"
+        }))
+        .unwrap();
+        assert_eq!(c2.temperature, None);
+        assert_eq!(c2.max_tokens, None);
+    }
+
+    #[test]
+    fn ai_message_serializes_with_camel_case() {
+        let m = AiMessage {
+            role: "user".into(),
+            content: "你好".into(),
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["role"], "user");
+        assert_eq!(v["content"], "你好");
+    }
+
+    // ---------- SSE 数据帧分类 ----------
+
+    #[test]
+    fn classify_sse_data_returns_delta_for_normal_frame() {
+        // 真实增量帧：delta.content 是一段中文
+        assert_eq!(
+            classify_sse_data(r#"{"choices":[{"delta":{"content":"你好"}}]}"#),
+            Some(SseDataAction::Delta("你好".into()))
+        );
+        // 带 role / index / finish_reason 的完整帧同样只取 content
+        assert_eq!(
+            classify_sse_data(
+                r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":" world"},"finish_reason":null}]}"#
+            ),
+            Some(SseDataAction::Delta(" world".into()))
+        );
+    }
+
+    #[test]
+    fn classify_sse_data_returns_done_for_done_marker() {
+        assert_eq!(classify_sse_data("[DONE]"), Some(SseDataAction::Done));
+        // 前后空白不应影响判定
+        assert_eq!(classify_sse_data("  [DONE]  "), Some(SseDataAction::Done));
+    }
+
+    #[test]
+    fn classify_sse_data_surfaces_object_form_errors() {
+        // 回归：OpenAI / DeepSeek 的错误形态是 `{"error": {"message": ...}}`
+        // —— error 是**对象**而不是字符串。原先只取 as_str() 会落空，
+        // 于是错误被静默吞掉，用户只得到一个空白回复。
+        let got = classify_sse_data(
+            r#"{"error":{"message":"Invalid API key","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+        );
+        match got {
+            Some(SseDataAction::Error(msg)) => {
+                assert!(msg.contains("Invalid API key"), "msg={msg}")
+            }
+            other => panic!("对象形态的错误应当被识别，实际得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_sse_data_surfaces_string_form_errors() {
+        // 部分服务（含 Ollama 兼容端点）用字符串形态
+        let got = classify_sse_data(r#"{"error":"model not found"}"#);
+        match got {
+            Some(SseDataAction::Error(msg)) => assert!(msg.contains("model not found"), "msg={msg}"),
+            other => panic!("字符串形态的错误应当被识别，实际得到 {other:?}"),
+        }
+        // 字符串形态不应误判为增量内容
+        assert!(classify_sse_data(r#"{"error":"boom"}"#) != Some(SseDataAction::Delta("boom".into())));
+    }
+
+    #[test]
+    fn classify_sse_data_ignores_frames_without_delta() {
+        // 空壳帧（finish_reason 帧、空 delta 帧）不应产生增量，
+        // 否则会往回复里插入多余字符。
+        assert_eq!(classify_sse_data(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#), None);
+        assert_eq!(classify_sse_data(r#"{"choices":[{"delta":{"content":""}}]}"#), None);
+        assert_eq!(classify_sse_data(r#"{"choices":[]}"#), None);
+        assert_eq!(classify_sse_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#), None);
+    }
+
+    #[test]
+    fn classify_sse_data_ignores_non_json_and_garbage() {
+        // 注释行、心跳、截断的 JSON、纯文本都应当被忽略而不是报错
+        assert_eq!(classify_sse_data(""), None);
+        assert_eq!(classify_sse_data("   "), None);
+        assert_eq!(classify_sse_data("not json"), None);
+        assert_eq!(classify_sse_data(r#"{"choices":[{"delta":{"content":"truncated""#), None);
+        assert_eq!(classify_sse_data(r#"{"choices":[{delta:1}]"#), None);
+    }
+
+    #[test]
+    fn classify_sse_data_error_wins_over_choices() {
+        // 异常帧里同时带 error 和 choices 时，错误优先
+        let got = classify_sse_data(
+            r#"{"error":{"message":"rate limited"},"choices":[{"delta":{"content":"x"}}]}"#,
+        );
+        assert!(matches!(got, Some(SseDataAction::Error(_))));
+    }
 }

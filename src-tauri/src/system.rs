@@ -242,10 +242,14 @@ fn parse_stats_macos(text: &str, host: &str, session_id: &str) -> Result<RemoteS
         .and_then(|block| {
             let line = block.lines().find(|l| l.contains("PhysMem"))?;
             // "PhysMem: 15G used (4255M wired), 17G unused."
+            // 逗号后面一段的**第一个**空白字段才是"未使用量"（"unused." 只是单位词），
+            // 取 nth(1) 会拿到 "unused." 导致 parse_bytes 失败，
+            // 于是整段内存数据被判为解析失败 → total/used 恒为 0，
+            // macOS 上「内存」这一项永远是 0%。这里必须是 nth(0)。
             let used_part = line.split('(').next()?;
             let used_str = used_part.split_whitespace().nth(1)?;
             let unused_part = line.split(',').nth(1)?;
-            let unused_str = unused_part.split_whitespace().nth(1)?;
+            let unused_str = unused_part.split_whitespace().nth(0)?;
             let used = parse_bytes(used_str)?;
             let unused = parse_bytes(unused_str)?;
             Some((used + unused, used))
@@ -623,5 +627,195 @@ mod tests {
         let s = split_sections("--- 指标 ---\n值\n");
         // 带空格的标记：名称是 " 指标 "，含首尾空格但内容正确
         assert!(s.keys().any(|k| k.contains("指标")));
+    }
+
+    // ---- 远程采集输出的完整解析（Linux / macOS 两种格式）----
+    //
+    // 这些测试用的输入与 collect_remote_stats 里实际执行的 shell 命令输出
+    // 逐字一致。监控面板全部数字都来自这两个解析函数，之前完全没有测试。
+
+    /// 与采集命令输出格式一致的完整 Linux 样本。
+    fn linux_sample() -> &'static str {
+        r#"---CPU1---
+cpu  100000 0 5000 100000 0 5000 0 0 0 0
+---NET1---
+1000000 2000000
+---SLEEP---
+（远端 sleep 1）
+---CPU2---
+cpu  110000 0 5000 105000 0 5000 0 0 0 0
+---NET2---
+1000250 2000500
+---MEM---
+total=16000000000 used=8000000000 avail=8000000000
+---CPUINFO---
+Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz
+---DSK---
+/dev/sda1 1000000000 400000000 600000000 40% /
+---DONE---
+"#
+    }
+
+    #[test]
+    fn parse_stats_linux_computes_every_metric() {
+        let info = parse_stats(linux_sample(), "10.0.0.5", "sess-1").unwrap();
+
+        assert_eq!(info.session_id, "sess-1");
+        assert_eq!(info.host, "10.0.0.5");
+
+        // CPU1 total=210000 idle=100000；CPU2 total=225000 idle=105000
+        // 使用率 = (1 - idleΔ/totalΔ) = (1 - 5000/15000) = 66.67%
+        assert!(
+            (info.cpu_percent - 66.666667).abs() < 1e-3,
+            "cpu_percent = {}",
+            info.cpu_percent
+        );
+        assert!(info.cpu_brand.contains("Xeon"));
+
+        assert_eq!(info.mem_total, 16_000_000_000);
+        assert_eq!(info.mem_used, 8_000_000_000);
+        assert_eq!(info.mem_percent, 50.0);
+
+        assert_eq!(info.net_rx, 250.0);
+        assert_eq!(info.net_tx, 500.0);
+
+        assert_eq!(info.disks.len(), 1);
+        let d = &info.disks[0];
+        // 设备名以 '/' 开头 → 取最后一列作为挂载点
+        assert_eq!(d.name, "/");
+        assert_eq!(d.total, 1_000_000_000);
+        assert_eq!(d.available, 600_000_000);
+        assert_eq!(d.percent, 40.0);
+    }
+
+    #[test]
+    fn parse_stats_missing_sections_give_zeros_without_panic() {
+        // 远端全部命令都失败（无标记）时不能 panic，也不能编出非零数据
+        let info = parse_stats("", "h", "s").unwrap();
+        assert_eq!(info.cpu_percent, 0.0);
+        assert_eq!(info.cpu_brand, "未知");
+        assert_eq!(info.mem_total, 0);
+        assert_eq!(info.mem_used, 0);
+        assert_eq!(info.mem_percent, 0.0);
+        assert_eq!(info.net_rx, 0.0);
+        assert_eq!(info.net_tx, 0.0);
+        assert!(info.disks.is_empty());
+    }
+
+    #[test]
+    fn parse_stats_counter_regress_yields_zero_not_negative() {
+        // /proc/stat 计数器在重启后回退。saturating_sub 必须兜住，
+        // 否则会出现负数使用率或除零。
+        let text = "---CPU1---\ncpu 900000 0 0 900000 0 0 0 0 0 0\n\
+                    ---CPU2---\ncpu 10000 0 0 10000 0 0 0 0 0 0\n---DONE---\n";
+        let info = parse_stats(text, "h", "s").unwrap();
+        assert!(
+            (0.0..=100.0).contains(&info.cpu_percent),
+            "cpu_percent = {}",
+            info.cpu_percent
+        );
+    }
+
+    #[test]
+    fn parse_stats_net_counter_regress_clamps_to_zero() {
+        // 网卡计数器回退 / 热插拔网卡时差分为负，max(0.0) 必须兜住
+        let text = "---NET1---\n999999 999999\n---NET2---\n1 1\n---DONE---\n";
+        let info = parse_stats(text, "h", "s").unwrap();
+        assert_eq!(info.net_rx, 0.0);
+        assert_eq!(info.net_tx, 0.0);
+    }
+
+    #[test]
+    fn parse_disks_drops_pseudo_filesystems() {
+        let block = Some(&String::from(
+            "tmpfs 99000000 1000000 98000000 1% /dev/shm\n\
+             devtmpfs 900000000 0 900000000 0% /dev\n\
+             overlay 500000000000 20000000000 480000000000 5% /\n\
+             squashfs 9000000000 9000000000 0 100% /snap/core\n\
+             /dev/loop2 9000000000 9000000000 0 100% /snap/foo\n\
+             /dev/nvme0n1p2 100000000000 30000000000 70000000000 30% /home\n",
+        ));
+        let disks = parse_disks(block);
+        assert_eq!(disks.len(), 1, "应只剩 /dev/nvme0n1p2，实际 {disks:?}");
+        assert_eq!(disks[0].name, "/home");
+        assert_eq!(disks[0].percent, 30.0);
+    }
+
+    #[test]
+    fn parse_disks_keeps_bare_device_names() {
+        // 不以 '/' 开头的设备名直接作为名称展示（不取最后一列）
+        let block = Some(&String::from(
+            "nvme0n1p1 80000000000 8000000000 72000000000 10% /\n",
+        ));
+        let disks = parse_disks(block);
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].name, "nvme0n1p1");
+        assert_eq!(disks[0].percent, 10.0);
+    }
+
+    #[test]
+    fn parse_stats_macos_parses_giga_and_mega_units() {
+        // top -l 1 的真实输出格式
+        let text = "---CPU1---\nCPU usage: 2.0% user, 3.0% sys, 95.0% idle\n\
+                    ---CPU2---\nCPU usage: 10.0% user, 5.0% sys, 85.0% idle\n\
+                    ---NET1---\n100000 200000\n\
+                    ---NET2---\n100250 200500\n\
+                    ---MEM---\nPhysMem: 15G used (4255M wired), 17G unused.\n\
+                    ---CPUINFO---\nApple M2 Pro\n\
+                    ---DSK---\n/dev/disk3s1 992377960448 442200000000 550177960448 45% /\n\
+                    ---DONE---\n";
+        let info = parse_stats_macos(text, "mbp", "s2").unwrap();
+
+        // 优先用后一次采样的 idle：100 - 85 = 15%
+        assert_eq!(info.cpu_percent, 15.0);
+        assert_eq!(info.cpu_brand, "Apple M2 Pro");
+
+        // total = 15G + 17G = 32G；used = 15G
+        let g: u64 = 1_073_741_824;
+        assert_eq!(info.mem_total, 32 * g, "mem_total = {}", info.mem_total);
+        assert_eq!(info.mem_used, 15 * g, "mem_used = {}", info.mem_used);
+        assert!((info.mem_percent - 46.875).abs() < 1e-3);
+
+        assert_eq!(info.net_rx, 250.0);
+        assert_eq!(info.net_tx, 500.0);
+        assert_eq!(info.disks.len(), 1);
+        assert_eq!(info.disks[0].name, "/");
+        assert!(
+            (info.disks[0].percent - 44.56).abs() < 0.01,
+            "disk percent = {}",
+            info.disks[0].percent
+        );
+    }
+
+    #[test]
+    fn parse_stats_macos_single_sample_does_not_report_zero_cpu() {
+        // 回归：只拿到第一次采样时，旧实现把 idle 兜底成 100.0，
+        // 于是 100.0 - 100.0 = 0%，把一台满载机器显示成 0% 使用率。
+        let text = "---CPU1---\nCPU usage: 40.0% user, 55.0% sys, 5.0% idle\n---DONE---\n";
+        let info = parse_stats_macos(text, "mbp", "s3").unwrap();
+        assert_eq!(info.cpu_percent, 95.0);
+    }
+
+    #[test]
+    fn parse_stats_macos_idle_over_100_clamps_to_zero() {
+        // idle 超过 100（脏数据）时 clamp 到 0，不能出现负使用率
+        let text = "---CPU2---\nCPU usage: 0% user, 0% sys, 150.0% idle\n---DONE---\n";
+        let info = parse_stats_macos(text, "h", "s").unwrap();
+        assert_eq!(info.cpu_percent, 0.0);
+    }
+
+    #[test]
+    fn parse_stats_macos_malformed_memory_yields_zeros_without_panic() {
+        // PhysMem 行格式异常时不得 panic，也不得编造数据
+        for text in [
+            "---MEM---\nPhysMem: nothing here\n---DONE---\n",
+            "---MEM---\n\n---DONE---\n",
+            "---DONE---\n",
+        ] {
+            let info = parse_stats_macos(text, "h", "s").unwrap();
+            assert_eq!(info.mem_total, 0, "text={text:?}");
+            assert_eq!(info.mem_used, 0, "text={text:?}");
+            assert_eq!(info.mem_percent, 0.0);
+        }
     }
 }

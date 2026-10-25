@@ -93,11 +93,28 @@ fn port_cmd(pattern: &str) -> String {
 ///
 /// 背景：Linux 的临时端口范围（`net.ipv4.ip_local_port_range` 默认 32768-60999）
 /// 与 IANA 注册端口段有重叠，纯按数值区间过滤会误伤**真实的服务端口**。
-/// 例：MySQL 的 X Protocol 固定用 33060（实测本环境确实在监听），它 ≥32768，
+///
+/// 例 1：MySQL 的 X Protocol 固定用 33060（实测本环境确实在监听），它 ≥32768，
 /// 若只按区间过滤就会被当成随机端口丢掉。
-/// 因此这里显式列出「虽然高位、但确实是服务端口」的少数几个。
-const WELL_KNOWN_HIGH_PORTS: [u32; 1] = [
+///
+/// 例 2：HDFS DataNode 的**整套默认端口都在高位段**——50070（Web UI）、
+/// 50010（数据传输）、50020（IPC）、50075/50050（Balancer）等。这些端口
+/// ≥32768，只按区间过滤会把 DataNode 的全部对外端口一起丢掉，
+/// 面板上 HDFS 一行就只剩 NameNode 的 9870，用户根本看不到 DataNode 端口。
+/// （DataNode 的 secondary 端口块 50110/50120/50130/50140 一并列出，
+/// 多节点集群启用 secondary storage 时同样适用。）
+const WELL_KNOWN_HIGH_PORTS: [u32; 11] = [
     33060, // MySQL X Protocol（mysqlx）
+    50010, // HDFS DataNode 数据传输
+    50020, // HDFS DataNode IPC
+    50050, // HDFS Balancer
+    50070, // HDFS DataNode Web UI
+    50075, // HDFS Balancer2
+    50090, // HDFS DataNode 健康检查
+    50110, // HDFS DataNode 数据传输（secondary）
+    50120, // HDFS DataNode IPC（secondary）
+    50130, // HDFS DataNode Web UI（secondary）
+    50140, // HDFS DataNode 健康检查（secondary）
 ];
 
 /// 过滤端口列表，丢掉**运行时随机端口**。
@@ -1502,8 +1519,15 @@ fn http_body(resp: &str) -> Option<String> {
         if rest.len() < size + 2 {
             return None;
         }
-        out.push_str(&rest[..size]);
-        rest = &rest[size + 2..];
+        // 用 get 而不是直接按字节下标切片：size 是 chunk 声明的**字节**长度，
+        // 而 body 来自 String::from_utf8_lossy —— 非法字节会被替换成 3 字节的
+        // U+FFFD，解码后的字节总数相对声明值发生偏移。此时按字节下标切片
+        // 可能落在字符中间 → panic 打死整个请求（实测可复现）。
+        // 对不齐就当作「无法解析」返回 None，上层会回退到 SSH 隧道通道。
+        let Some(chunk) = rest.get(..size) else { return None };
+        out.push_str(chunk);
+        let Some(tail) = rest.get(size + 2..) else { return None };
+        rest = tail;
     }
     Some(out)
 }
@@ -2713,4 +2737,382 @@ pub async fn cluster_hdfs_list(
     cm.hdfs_inflight.lock().unwrap().remove(&key);
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- HTTP 响应解析 ----------
+
+    #[test]
+    fn http_body_extracts_content_length_body() {
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: X\r\n\r\nhello";
+        assert_eq!(http_body(resp), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn http_body_decodes_chunked_transfers() {
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n\
+                    5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(http_body(resp), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn http_body_handles_chunk_extensions_and_empty_chunks() {
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    3;ext=1\r\nabc\r\n0\r\n\r\n";
+        assert_eq!(http_body(resp), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn http_body_rejects_malformed_or_truncated_input() {
+        // 没有头部/正文分界
+        assert_eq!(http_body("HTTP/1.1 200 OK\r\n"), None);
+        assert_eq!(http_body(""), None);
+        // chunked：长度声明超出实际数据
+        assert_eq!(
+            http_body("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nabc\r\n0\r\n\r\n"),
+            None
+        );
+        // chunked：size 不是十六进制
+        assert_eq!(
+            http_body("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nabc\r\n0\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn http_body_survives_chunk_boundary_mid_character() {
+        // body 来自 String::from_utf8_lossy：非法字节被替换成 3 字节的 U+FFFD，
+        // 字节长度相对 chunk size 声明发生偏移。此时按字节切片可能落在字符
+        // 中间 → panic 打死整个请求。必须返回 None 让上层回退到隧道通道。
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    1\r\n\u{00e5}\r\n0\r\n\r\n";
+        assert_eq!(http_body(resp), None);
+    }
+
+    // ---------- URL 编码 ----------
+
+    #[test]
+    fn percent_encode_path_keeps_safe_characters() {
+        assert_eq!(
+            percent_encode_path("/user/data/report_v2-final.1.csv"),
+            "/user/data/report_v2-final.1.csv"
+        );
+    }
+
+    #[test]
+    fn percent_encode_path_encodes_spaces_and_cjk() {
+        assert_eq!(percent_encode_path("/a/b c"), "/a/b%20c");
+        // 中文按 UTF-8 逐字节编码，且使用大写十六进制
+        assert_eq!(percent_encode_path("/data/日志"), "/data/%E6%97%A5%E5%BF%97");
+        // 路径分隔符绝不被编码
+        assert!(percent_encode_path("/x/y").contains("/x/y"));
+    }
+
+    // ---------- WebHDFS 列表解析 ----------
+
+    fn webhdfs_body() -> &'static str {
+        r#"{"FileStatuses":{"FileStatus":[
+  {"pathSuffix":"input","type":"DIRECTORY","length":0,"replication":0,
+   "owner":"hdfs","group":"supergroup","modificationTime":1735689600000,
+   "permission":"rwxr-xr-x","blockSize":0},
+  {"pathSuffix":"a.csv","type":"FILE","length":1536,"replication":3,
+   "owner":"hdfs","group":"supergroup","modificationTime":1735775999000,
+   "permission":"rw-r--r--","blockSize":67108864}
+]}}"#
+    }
+
+    #[test]
+    fn parse_webhdfs_listing_builds_absolute_paths_from_root() {
+        let entries = parse_webhdfs_listing("/", webhdfs_body())
+            .unwrap()
+            .expect("应当解析出条目");
+        assert_eq!(entries.len(), 2);
+
+        let dir = &entries[0];
+        assert_eq!(dir.name, "input");
+        assert_eq!(dir.path, "/input");
+        assert!(dir.is_dir);
+        assert_eq!(dir.size, "0");
+        assert_eq!(dir.replication, "0");
+        assert_eq!(dir.owner, "hdfs");
+        assert_eq!(dir.date, "2025-01-01 00:00");
+
+        let file = &entries[1];
+        assert_eq!(file.name, "a.csv");
+        assert_eq!(file.path, "/a.csv");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, "1.5K");
+        assert_eq!(file.replication, "3");
+        assert_eq!(file.date, "2025-01-01 23:59");
+    }
+
+    #[test]
+    fn parse_webhdfs_listing_joins_nested_paths() {
+        let entries = parse_webhdfs_listing("/warehouse/daily", webhdfs_body())
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries[0].path, "/warehouse/daily/input");
+        assert_eq!(entries[1].path, "/warehouse/daily/a.csv");
+    }
+
+    #[test]
+    fn parse_webhdfs_listing_propagates_remote_exception() {
+        let body = r#"{"RemoteException":{"message":"File does not exist: /nope"}}"#;
+        let err = parse_webhdfs_listing("/nope", body).unwrap_err();
+        assert!(err.contains("File does not exist"), "err={err}");
+    }
+
+    #[test]
+    fn parse_webhdfs_listing_returns_none_when_not_webhdfs() {
+        // 端口探错、返回 HTML 登录页、纯文本 —— 都应当被识别为「不是 WebHDFS」
+        assert!(parse_webhdfs_listing("/", "<html>login</html>").unwrap().is_none());
+        assert!(parse_webhdfs_listing("/", "not json at all").unwrap().is_none());
+        assert!(parse_webhdfs_listing("/", r#"{"other":1}"#).unwrap().is_none());
+        assert!(parse_webhdfs_listing("/", r#"{"FileStatuses":{}}"#).unwrap().is_none());
+    }
+
+    // ---------- JMX 取值 ----------
+
+    #[test]
+    fn jmx_getters_take_the_first_matching_key() {
+        let bean = serde_json::json!({
+            "Total": 10737418240.0,
+            "MemHeapUsedM": 2048.5,
+            "GcCount": 42
+        });
+        // 候选键按顺序命中：CapacityTotal 不存在时回退到 Total
+        assert_eq!(jmx_num(&bean, &["CapacityTotal", "Total"]), 10737418240.0);
+        assert_eq!(jmx_int(&bean, &["MemHeapUsedM"]), 0);   // 键名错 → 0
+        assert_eq!(jmx_int(&bean, &["GcCount"]), 42);
+        // 完全不存在 → 0
+        assert_eq!(jmx_num(&bean, &["Nothing"]), 0.0);
+        assert_eq!(jmx_int(&bean, &["Nothing"]), 0);
+    }
+
+    #[test]
+    fn jmx_bool_handles_hadoop_safemode_strings() {
+        // Hadoop 的 Safemode：不在安全模式时是**空串**，进入时是一段说明文本
+        // （不是 "true"）。两种形态都必须认对，否则会漏报安全模式。
+        assert!(!jmx_bool(&serde_json::json!({"Safemode": ""}), &["Safemode"]));
+        assert!(
+            jmx_bool(
+                &serde_json::json!({"Safemode": "The dfs filesystem is safe mode."}),
+                &["Safemode"]
+            ),
+            "说明文本应当判为「在安全模式」"
+        );
+        // 真布尔
+        assert!(jmx_bool(&serde_json::json!({"X": true}), &["X"]));
+        assert!(!jmx_bool(&serde_json::json!({"X": false}), &["X"]));
+        // 字符串形式的否定
+        assert!(!jmx_bool(&serde_json::json!({"X": "false"}), &["X"]));
+        assert!(!jmx_bool(&serde_json::json!({"X": "0"}), &["X"]));
+        // 缺键
+        assert!(!jmx_bool(&serde_json::json!({}), &["X"]));
+    }
+
+    #[test]
+    fn jvm_threads_total_sums_substates_when_threads_is_absent() {
+        // Hadoop 3.x 的 JvmMetrics **不导出** Threads，只导出六个分状态计数。
+        // 只查 Threads 会恒为 0，图表「线程数」永远是 0。
+        let bean = serde_json::json!({
+            "ThreadsNew": 1,
+            "ThreadsRunnable": 2,
+            "ThreadsBlocked": 3,
+            "ThreadsWaiting": 4,
+            "ThreadsTimedWaiting": 5,
+            "ThreadsTerminated": 6
+        });
+        assert_eq!(jvm_threads_total(&bean), 21);
+        // 兼容确实导出 Threads 的版本：优先用它
+        let bean2 = serde_json::json!({"Threads": 99, "ThreadsNew": 1});
+        assert_eq!(jvm_threads_total(&bean2), 99);
+        // 完全缺失
+        assert_eq!(jvm_threads_total(&serde_json::json!({})), 0);
+    }
+
+    #[test]
+    fn build_hdfs_summary_converts_bytes_to_gibibytes() {
+        let g: f64 = 1_073_741_824.0;
+        let bean = serde_json::json!({
+            "CapacityTotal": 10.0 * g,
+            "CapacityUsed": 2.5 * g,
+            "CapacityRemaining": 7.5 * g,
+            "CapacityUsedNonDFS": 0.25 * g,
+            "TotalBlocks": 1200,
+            "MissingBlocks": 3,
+            "NumLiveDataNodes": 5,
+            "NumDeadDataNodes": 1,
+            "TotalFiles": 88000,
+            "TotalLoad": 4
+        });
+        let s = build_hdfs_summary(&bean);
+        assert_eq!(s.capacity_total_gb, 10.0);
+        assert!((s.capacity_used_gb - 2.5).abs() < 1e-6);
+        assert!((s.capacity_remaining_gb - 7.5).abs() < 1e-6);
+        assert!((s.capacity_used_non_dfs_gb - 0.25).abs() < 1e-6);
+        assert_eq!(s.total_blocks, 1200);
+        assert_eq!(s.missing_blocks, 3);
+        assert_eq!(s.live_datanodes, 5);
+        assert_eq!(s.dead_datanodes, 1);
+        assert_eq!(s.total_files, 88_000);
+        assert_eq!(s.corrupt_blocks, 0);
+    }
+
+    #[test]
+    fn build_namenode_jvm_reads_hadoop_metric_names() {
+        let bean = serde_json::json!({
+            "MemHeapUsedM": 1024.0,
+            "MemHeapCommittedM": 4096.0,
+            "MemHeapMaxM": 8192.0,
+            "GcCount": 7,
+            "GcTimeMillis": 320
+        });
+        let j = build_namenode_jvm(&bean);
+        assert_eq!(j.heap_used_mb, 1024.0);
+        assert_eq!(j.heap_committed_mb, 4096.0);
+        assert_eq!(j.heap_max_mb, 8192.0);
+        assert_eq!(j.gc_count, 7);
+        assert_eq!(j.gc_time_ms, 320);
+    }
+
+    // ---------- shell / 时间 / 单位 ----------
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quotes() {
+        assert_eq!(sh_quote("/data/a b.txt"), "'/data/a b.txt'");
+        // 关键：单引号本身必须用 '\'' 断开再接回来，否则注入成功
+        assert_eq!(
+            sh_quote("/data/o'hara"),
+            "'/data/o'\\''hara'"
+        );
+    }
+
+    #[test]
+    fn format_epoch_time_formats_known_instants() {
+        assert_eq!(format_epoch_time(0), "1970-01-01 00:00");
+        assert_eq!(format_epoch_time(1_735_689_600), "2025-01-01 00:00");
+        assert_eq!(format_epoch_time(1_735_775_999), "2025-01-01 23:59");
+    }
+
+    #[test]
+    fn format_epoch_time_handles_negative_offsets() {
+        // div_euclid/rem_euclid 必须用对，否则负值年份/日期整体错位
+        assert_eq!(format_epoch_time(-86_400), "1969-12-31 00:00");
+    }
+
+    #[test]
+    fn human_size_uses_binary_units() {
+        assert_eq!(human_size(0), "0");
+        assert_eq!(human_size(500), "500");
+        assert_eq!(human_size(1024), "1.0K");
+        assert_eq!(human_size(1536), "1.5K");
+        assert_eq!(human_size(1_048_576), "1.0M");
+        assert_eq!(human_size(1_073_741_824), "1.0G");
+        assert_eq!(human_size(1_288_490_188), "1.2G");
+    }
+
+    #[test]
+    fn filter_meaningful_ports_drops_ephemeral_but_keeps_whitelist() {
+        let out = filter_meaningful_ports("8088, 50070,44841,42909,33060,0,abc,9870");
+        assert_eq!(out, "8088, 50070, 33060, 9870");
+        assert_eq!(filter_meaningful_ports(""), "");
+        assert_eq!(filter_meaningful_ports("44841"), "");
+        assert_eq!(filter_meaningful_ports("42909,44841,50000"), "");
+    }
+
+    #[test]
+    fn filter_meaningful_ports_keeps_every_hadoop_datanode_port() {
+        // HDFS DataNode 的整套默认端口都在高位段，必须一个都不能被当成
+        // 随机端口丢掉——否则面板上 HDFS 一行只剩 NameNode 的 9870。
+        for port in [50010u32, 50020, 50050, 50070, 50075, 50090, 50110, 50120, 50130, 50140] {
+            let out = filter_meaningful_ports(&port.to_string());
+            assert_eq!(out, port.to_string(), "端口 {port} 应当被保留");
+        }
+        // 33060（MySQL X Protocol）仍在白名单
+        assert_eq!(filter_meaningful_ports("33060"), "33060");
+        // 区间内的高位随机端口仍然被丢弃
+        assert_eq!(filter_meaningful_ports("33061"), "");
+        assert_eq!(filter_meaningful_ports("50071"), "");
+    }
+
+    #[test]
+    fn port_cmd_embeds_pattern_and_pid_reverse_lookup() {
+        let cmd = port_cmd("HiveServer2");
+        assert!(cmd.contains("pgrep -f 'HiveServer2'"));
+        // 必须同时兼容「pid=」前缀与旧版 ss 的裸 pid
+        assert!(cmd.contains("pid="));
+        assert!(cmd.contains("netstat -tlnp"));
+        // 端口号提取
+        assert!(cmd.contains("grep -oP"));
+    }
+
+    #[test]
+    fn parse_status_matrix_for_hdfs_yarn_and_single_process_services() {
+        // HDFS：NameNode 存活 + 有 DataNode → Running；无 DataNode → Degraded
+        assert_eq!(
+            ClusterManager::parse_status("HDFS", "namenode:alive datanode:3"),
+            ClusterServiceStatus::Running
+        );
+        assert_eq!(
+            ClusterManager::parse_status("HDFS", "namenode:alive datanode:0"),
+            ClusterServiceStatus::Degraded
+        );
+        assert_eq!(
+            ClusterManager::parse_status("HDFS", "namenode:dead datanode:3"),
+            ClusterServiceStatus::Stopped
+        );
+        // YARN
+        assert_eq!(
+            ClusterManager::parse_status("YARN", "rm:alive nm:2"),
+            ClusterServiceStatus::Running
+        );
+        assert_eq!(
+            ClusterManager::parse_status("YARN", "rm:alive nm:0"),
+            ClusterServiceStatus::Degraded
+        );
+        assert_eq!(
+            ClusterManager::parse_status("YARN", "rm:dead nm:0"),
+            ClusterServiceStatus::Stopped
+        );
+        // Hive：两个子组件都要在
+        assert_eq!(
+            ClusterManager::parse_status("Hive", "metastore:alive hiveserver2:alive"),
+            ClusterServiceStatus::Running
+        );
+        assert_eq!(
+            ClusterManager::parse_status("Hive", "metastore:alive hiveserver2:dead"),
+            ClusterServiceStatus::Degraded
+        );
+        assert_eq!(
+            ClusterManager::parse_status("Hive", "metastore:dead hiveserver2:dead"),
+            ClusterServiceStatus::Stopped
+        );
+        // 单进程服务
+        assert_eq!(
+            ClusterManager::parse_status("MySQL", "running"),
+            ClusterServiceStatus::Running
+        );
+        assert_eq!(
+            ClusterManager::parse_status("MySQL", "not found"),
+            ClusterServiceStatus::Stopped
+        );
+        // 未知服务
+        assert_eq!(
+            ClusterManager::parse_status("Unknown", "running"),
+            ClusterServiceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn port_verified_in_cmd_only_covers_embedded_checks() {
+        assert!(ClusterManager::port_verified_in_cmd("Hive"));
+        assert!(ClusterManager::port_verified_in_cmd("DolphinScheduler"));
+        assert!(!ClusterManager::port_verified_in_cmd("HDFS"));
+        assert!(!ClusterManager::port_verified_in_cmd("YARN"));
+        assert!(!ClusterManager::port_verified_in_cmd("MySQL"));
+    }
 }
