@@ -754,7 +754,19 @@ impl ClusterManager {
                     .await;
                 match new_status {
                     ClusterServiceStatus::Running => Ok(format!("{} 启动成功", cfg.name)),
-                    ClusterServiceStatus::Degraded => Ok(format!("{} 启动（部分）", cfg.name)),
+                    // 超时后仍未完全就绪（进程在但 HTTP 端口未监听）→ 报失败，
+                    // 让前端知道启动没完成，而不是误导用户"启动成功"。
+                    ClusterServiceStatus::Degraded => {
+                        let err = self
+                            .start_failure_diag(handle_arc, key, &stderr, rc)
+                            .await;
+                        Err(format!(
+                            "{} 启动超时: 进程已启动但 HTTP 端口未就绪，{} {}",
+                            cfg.name,
+                            Self::start_timeout(key),
+                            err
+                        ))
+                    }
                     _ => {
                         // 失败诊断：check_status 的 error_cache 对多数服务为空
                         //（pgrep/ss 无 stderr），start 命令真正的错误在 stderr 与
@@ -1004,7 +1016,17 @@ impl ClusterManager {
                         .await;
                     match new_status {
                         ClusterServiceStatus::Running => Ok(format!("{} 重启成功", cfg.name)),
-                        ClusterServiceStatus::Degraded => Ok(format!("{} 重启（部分）", cfg.name)),
+                        ClusterServiceStatus::Degraded => {
+                            let err = self
+                                .start_failure_diag(handle_arc, key, &stderr, rc)
+                                .await;
+                            Err(format!(
+                                "{} 重启超时: 进程已启动但 HTTP 端口未就绪，{} {}",
+                                cfg.name,
+                                Self::start_timeout(key),
+                                err
+                            ))
+                        }
                         _ => {
                             let err = self
                                 .start_failure_diag(handle_arc, key, &stderr, rc)
