@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "myterm"
-version = "1.0.45"
+version = "1.0.46"
 dependencies = [
  "base64 0.22.1",
  "bytes",
