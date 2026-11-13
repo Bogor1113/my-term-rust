@@ -27,6 +27,12 @@ pub struct RemoteSysInfo {
     pub net_rx: f64,
     /// 上行速率（字节/秒）
     pub net_tx: f64,
+    /// 系统运行时长（秒；采集失败为 0）
+    pub uptime_secs: u64,
+    /// 登录用户数（who 去重会话数；采集失败为 0）
+    pub user_count: u32,
+    /// 会话数最多的登录用户名（空表示未知）
+    pub top_user: String,
     pub disks: Vec<RemoteDiskInfo>,
 }
 
@@ -149,6 +155,10 @@ echo "---MEM---"
 free -b 2>/dev/null | awk '/^Mem:/ {printf "total=%s used=%s avail=%s\n",$2,$3,$7}'
 echo "---CPUINFO---"
 cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1 | cut -d: -f2- | sed 's/^ *//'
+echo "---UPTIME---"
+awk '{print int($1)}' /proc/uptime 2>/dev/null
+echo "---USERS---"
+who 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -1
 echo "---DSK---"
 df -B1 2>/dev/null | awk 'NR>1 {print $1,$2,$3,$4,$5,$6}'
 echo "---DONE---"
@@ -170,6 +180,10 @@ echo "---MEM---"
 top -l 1 -n 0 2>/dev/null | grep "^PhysMem"
 echo "---CPUINFO---"
 sysctl -n machdep.cpu.brand_string 2>/dev/null
+echo "---UPTIME---"
+echo $(( $(date +%s) - $(sysctl -n kern.boottime 2>/dev/null | awk -F'sec = ' '{print $2}' | awk '{print $1}') ))
+echo "---USERS---"
+who 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -1
 echo "---DSK---"
 df -B1 2>/dev/null | awk 'NR>1 {print $1,$2,$3,$4,$5,$6}'
 echo "---DONE---"
@@ -186,6 +200,9 @@ echo "---DONE---"
             mem_percent: 0.0,
             net_rx: 0.0,
             net_tx: 0.0,
+            uptime_secs: 0,
+            user_count: 0,
+            top_user: String::new(),
             disks: vec![],
         });
     };
@@ -196,6 +213,28 @@ echo "---DONE---"
     } else {
         parse_stats(&text, &host, session_id)
     }
+}
+
+/// 解析 `---UPTIME---` 段：单行整数秒（命令失败时该段为空）
+fn parse_uptime(block: Option<&String>) -> u64 {
+    block
+        .and_then(|b| b.lines().next())
+        .and_then(|l| l.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// 解析 `---USERS---` 段：`uniq -c` 输出形如 "  2 root"（会话数 用户名）。
+/// 无输出（采集失败或无人登录）返回 (0, "")。
+fn parse_users(block: Option<&String>) -> (u32, String) {
+    let Some(block) = block else { return (0, String::new()) };
+    let line = block.lines().next().unwrap_or("").trim();
+    let mut it = line.split_whitespace();
+    let count = it
+        .next()
+        .and_then(|c| c.parse::<u32>().ok())
+        .unwrap_or(0);
+    let user = it.next().unwrap_or("").to_string();
+    (count, user)
 }
 
 /// 解析 macOS 采集输出（top / vm_stat / netstat / df）
@@ -281,6 +320,8 @@ fn parse_stats_macos(text: &str, host: &str, session_id: &str) -> Result<RemoteS
     // 磁盘：与 Linux 相同的 df -B1 解析
     let disks = parse_disks(sections.get("DSK"));
 
+    let (user_count, top_user) = parse_users(sections.get("USERS"));
+
     Ok(RemoteSysInfo {
         session_id: session_id.to_string(),
         host: host.to_string(),
@@ -295,6 +336,9 @@ fn parse_stats_macos(text: &str, host: &str, session_id: &str) -> Result<RemoteS
         mem_percent,
         net_rx,
         net_tx,
+        uptime_secs: parse_uptime(sections.get("UPTIME")),
+        user_count,
+        top_user,
         disks,
     })
 }
@@ -412,6 +456,8 @@ fn parse_stats(text: &str, host: &str, session_id: &str) -> Result<RemoteSysInfo
     // 磁盘
     let disks = parse_disks(sections.get("DSK"));
 
+    let (user_count, top_user) = parse_users(sections.get("USERS"));
+
     Ok(RemoteSysInfo {
         session_id: session_id.to_string(),
         host: host.to_string(),
@@ -422,6 +468,9 @@ fn parse_stats(text: &str, host: &str, session_id: &str) -> Result<RemoteSysInfo
         mem_percent,
         net_rx,
         net_tx,
+        uptime_secs: parse_uptime(sections.get("UPTIME")),
+        user_count,
+        top_user,
         disks,
     })
 }
@@ -650,6 +699,10 @@ cpu  110000 0 5000 105000 0 5000 0 0 0 0
 total=16000000000 used=8000000000 avail=8000000000
 ---CPUINFO---
 Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz
+---UPTIME---
+152000
+---USERS---
+  2 root
 ---DSK---
 /dev/sda1 1000000000 400000000 600000000 40% /
 ---DONE---
@@ -679,6 +732,11 @@ Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz
         assert_eq!(info.net_rx, 250.0);
         assert_eq!(info.net_tx, 500.0);
 
+        // 运行时长 / 登录用户
+        assert_eq!(info.uptime_secs, 152_000);
+        assert_eq!(info.user_count, 2);
+        assert_eq!(info.top_user, "root");
+
         assert_eq!(info.disks.len(), 1);
         let d = &info.disks[0];
         // 设备名以 '/' 开头 → 取最后一列作为挂载点
@@ -699,6 +757,9 @@ Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz
         assert_eq!(info.mem_percent, 0.0);
         assert_eq!(info.net_rx, 0.0);
         assert_eq!(info.net_tx, 0.0);
+        assert_eq!(info.uptime_secs, 0);
+        assert_eq!(info.user_count, 0);
+        assert_eq!(info.top_user, "");
         assert!(info.disks.is_empty());
     }
 
@@ -751,6 +812,29 @@ Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz
         assert_eq!(disks.len(), 1);
         assert_eq!(disks[0].name, "nvme0n1p1");
         assert_eq!(disks[0].percent, 10.0);
+    }
+
+    #[test]
+    fn parse_users_and_uptime_handle_variants() {
+        // 正常 uniq -c 输出（带 uniq -c 的前导空格）
+        let (c, u) = parse_users(Some(&String::from("  3 admin\n")));
+        assert_eq!((c, u.as_str()), (3, "admin"));
+
+        // 空段 / 缺失段
+        assert_eq!(parse_users(Some(&String::from("\n"))), (0, String::new()));
+        assert_eq!(parse_users(None), (0, String::new()));
+
+        // 脏数据：非数字开头 → count 兜 0，用户名取第二个字段（前端在
+        // count==0 时不展示用户名，因此不会误报）
+        let (c, u) = parse_users(Some(&String::from("root root\n")));
+        assert_eq!(c, 0);
+        assert_eq!(u, "root");
+
+        // uptime：正常整数 / 空段 / 脏数据
+        assert_eq!(parse_uptime(Some(&String::from("3600\n"))), 3600);
+        assert_eq!(parse_uptime(Some(&String::from("\n"))), 0);
+        assert_eq!(parse_uptime(Some(&String::from("abc\n"))), 0);
+        assert_eq!(parse_uptime(None), 0);
     }
 
     #[test]

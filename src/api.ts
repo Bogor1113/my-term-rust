@@ -1,6 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Channel } from '@tauri-apps/api/core';
 import type {
+  AgentCommandResult,
+  AgentCompletion,
+  AgentMessage,
+  AgentWriteScriptResult,
   AiConfig,
   AiMessage,
   ClusterServiceInfo,
@@ -134,6 +138,56 @@ export function aiChatStream(
 /** 停止生成：中断一次进行中的流式请求（幂等，请求不存在时静默成功） */
 export function aiChatCancel(requestId: string): Promise<void> {
   return invoke<void>('ai_chat_cancel', { requestId });
+}
+
+/**
+ * Agent 的一轮非流式调用：带工具定义请求模型，返回文本 + 工具调用请求。
+ * 由前端执行工具后把结果作为 role="tool" 消息回传，循环直到模型给出最终答复。
+ */
+export function aiChatComplete(
+  config: AiConfig,
+  messages: AgentMessage[],
+): Promise<AgentCompletion> {
+  return invoke<AgentCompletion>('ai_chat_complete', { config, messages });
+}
+
+/** Agent 工具：在指定会话执行远程命令（stdout / stderr / 退出码） */
+export function agentRunCommand(
+  sessionId: string,
+  command: string,
+  timeoutSecs?: number,
+  requestId?: string,
+): Promise<AgentCommandResult> {
+  return invoke<AgentCommandResult>('agent_run_command', {
+    sessionId,
+    command,
+    timeoutSecs,
+    requestId,
+  });
+}
+
+/** Agent 工具：把脚本内容写到远程服务器（自动建目录 + chmod 755），可选立即执行 */
+export function agentWriteScript(
+  sessionId: string,
+  path: string,
+  content: string,
+  execute = false,
+  timeoutSecs?: number,
+  requestId?: string,
+): Promise<AgentWriteScriptResult> {
+  return invoke<AgentWriteScriptResult>('agent_write_script', {
+    sessionId,
+    path,
+    content,
+    execute,
+    timeoutSecs,
+    requestId,
+  });
+}
+
+/** 停止 Agent 正在执行的远程命令（幂等，请求不存在时静默成功） */
+export function agentCancel(requestId: string): Promise<void> {
+  return invoke<void>('agent_cancel', { requestId });
 }
 
 /** 取回某会话最近一段终端输出（去 ANSI），供 AI 分析上下文 */

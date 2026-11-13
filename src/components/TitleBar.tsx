@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { version } from '../../package.json';
 
 /**
  * 自绘标题栏：原生装饰已关闭（tauri.conf.json decorations:false），
  * 顶部这条玻璃质感条替代系统标题栏，拖拽区 + 最小化/最大化/关闭。
  * 双击拖拽区由 Tauri 的 data-tauri-drag-region 自动处理为最大化/还原。
+ * 版本号在构建期从 package.json 读取，与 bump-version.mjs 自动同步。
  */
 export default function TitleBar() {
   const appWindow = getCurrentWindow();
@@ -36,6 +38,9 @@ export default function TitleBar() {
         </span>
         <span className="titlebar-sub" data-tauri-drag-region>
           波哥自研
+        </span>
+        <span className="titlebar-version" data-tauri-drag-region title={`当前版本 v${version}`}>
+          v{version}
         </span>
       </div>
 

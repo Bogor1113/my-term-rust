@@ -1,6 +1,6 @@
 [package]
 name = "myterm"
-version = "2.0.0"
+version = "2.0.6"
 description = "MyTerm - 跨平台远程 SSH 终端工具，集成 SFTP 文件管理与系统资源监控"
 authors = ["MyTerm"]
 edition = "2021"
@@ -42,3 +42,18 @@ futures = "0.3"
 base64 = "0.22"
 bytes = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "default-tls"] }
+drag = "2.1.1"
+# 拖拽下载（drag.rs）：OLE 拖拽源 DoDragDrop + SHCreateDataObject/SHParseDisplayName
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_SystemServices",
+  "Win32_System_Memory",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
+# #[implement(IDropSource)] 宏展开会直接引用 ::windows_core，需要显式依赖
+windows-core = "0.61"

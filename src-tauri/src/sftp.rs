@@ -132,9 +132,12 @@ impl Drop for PendingConflictGuard<'_> {
     }
 }
 
-/// 在指定会话上打开一个 SFTP 子系统通道
-async fn open_sftp(
-    state: &State<'_, AppState>,
+/// 在指定会话上打开一个 SFTP 子系统通道。
+///
+/// `pub(crate)`：AI Agent 的 write_script 工具也要用同一条通道写文件，
+/// 复用这里的超时与错误处理，避免两套实现各自踩坑。
+pub(crate) async fn open_sftp(
+    state: &AppState,
     session_id: &str,
 ) -> Result<SftpSession, String> {
     // 仅快速克隆句柄 Arc 随即释放全局 sessions 锁，
@@ -587,7 +590,7 @@ async fn ensure_remote_dir(sftp: &SftpSession, path: &str) -> Result<(), String>
 }
 
 /// 归一化远程路径（仅做等价规范化，不解析符号链接）
-fn normalize_remote_path(p: &str) -> String {
+pub(crate) fn normalize_remote_path(p: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for seg in p.split('/') {
         match seg {
@@ -635,7 +638,7 @@ fn join_remote(base: &str, rel: &str) -> String {
 /// russh-sftp 的 error 模块是私有的，只能按 Display 文本匹配 —— 这是该库
 /// 在不启用额外 feature 时的唯一可用手段。目的是把"确实不存在"与
 /// "权限不足 / IO 失败"区分开：前者可以安全地认为目标名空闲，后者不行。
-fn is_not_found(e: &russh_sftp::client::error::Error) -> bool {
+pub(crate) fn is_not_found(e: &russh_sftp::client::error::Error) -> bool {
     let msg = e.to_string();
     msg.contains("No such file") || msg.contains("no such file")
 }

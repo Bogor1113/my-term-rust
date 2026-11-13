@@ -1,5 +1,7 @@
+mod agent;
 mod ai;
 mod cluster;
+mod drag;
 mod sftp;
 mod ssh;
 mod system;
@@ -165,6 +167,10 @@ pub fn run() {
             system::set_monitor_session,
             ai::ai_chat_stream,
             ai::ai_chat_cancel,
+            ai::ai_chat_complete,
+            agent::agent_run_command,
+            agent::agent_write_script,
+            agent::agent_cancel,
             sftp::sftp_home,
             sftp::sftp_list,
             sftp::sftp_mkdir,
@@ -173,6 +179,7 @@ pub fn run() {
             sftp::sftp_download,
             sftp::sftp_upload,
             sftp::sftp_resolve_conflict,
+            drag::drag_out_files,
             cluster::cluster_list_services,
             cluster::cluster_service_action,
             cluster::cluster_service_logs,

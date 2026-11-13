@@ -194,6 +194,10 @@ export default function App() {
   // 提示符跟踪：每个会话最近一次导航的目录 / 挂起的 ~ 路径
   const lastNavCwdRef = useRef<Record<string, string>>({});
   const pendingCwdRef = useRef<Record<string, string>>({});
+  // 按键检测到的 cd：等面板成功列出目标目录后才写入 cwdDirRef。
+  // 敲错路径 / 无权限时面板会报错而不是提交，避免基准目录被污染后
+  // 后续相对路径 cd 与面板跟随全部漂移。
+  const pendingCdRef = useRef<Record<string, string>>({});
   // 最新 activeId 与 sftpOpen（供异步回调校验）
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
@@ -340,7 +344,8 @@ export default function App() {
       },
     ]);
     setActiveId(id);
-    setSftpOpen(false);
+    // 登录成功后自动展开侧边 SFTP 文件面板（无需手动点右上角文件夹图标）
+    setSftpOpen(true);
   };
 
   // 拉取已连接会话。抽成独立函数供集群选择器与端口转发面板共用 ——
@@ -437,6 +442,7 @@ export default function App() {
     delete pendingPrevRef.current[id];
     delete lastNavCwdRef.current[id];
     delete pendingCwdRef.current[id];
+    delete pendingCdRef.current[id];
     // 标记为已关闭：在途的 sftpHome 等异步回调回来后据此判断，
     // 不要把一个已关闭会话的 home 重新写回 homeDirRef（那会造成永不回收的残留）
     closedIdsRef.current.add(id);
@@ -689,6 +695,8 @@ export default function App() {
       // 记录前一个目录；仅当面板成功加载目标目录后（onPathLoaded）才
       // 提交为 OLDPWD，避免 cd 敲错路径后污染 `cd -` 的目标
       pendingPrevRef.current[sessionId] = cwd;
+      // 目标目录同样等面板加载成功后再写入 cwdDirRef（见 handlePathLoaded）
+      pendingCdRef.current[sessionId] = target;
       setNavReq((prev) => ({ path: target, nonce: (prev?.nonce ?? 0) + 1 }));
       // 如果 SFTP 未打开，则自动打开
       if (!sftpOpenRef.current) setSftpOpen(true);
@@ -719,6 +727,8 @@ export default function App() {
       return; // 无法识别的提示符路径，忽略
     }
     cwdDirRef.current[id] = cwd;
+    // 提示符是权威来源：之前按键检测到但尚未确认的 cd 一并作废
+    delete pendingCdRef.current[id];
     delete pendingCwdRef.current[id];
     const last = lastNavCwdRef.current[id];
     if (cwd !== last) {
@@ -744,14 +754,35 @@ export default function App() {
   // cd 导航请求已被 SFTP 面板消费
   const handleNavConsumed = useCallback(() => setNavReq(null), []);
 
-  // SFTP 面板成功加载目录 → 提交该次 cd 导航的 OLDPWD（`cd -` 依赖）
-  const handlePathLoaded = useCallback((id: string, _path: string) => {
+  // SFTP 面板成功加载目录 → 提交该次 cd 导航的 OLDPWD（`cd -` 依赖），
+  // 并把按键检测到的 cd 目标确认为 shell 当前目录（提示符不可解析时，
+  // 这是后续相对路径 cd 的唯一基准）。
+  const handlePathLoaded = useCallback((id: string, path: string) => {
     const prev = pendingPrevRef.current[id];
     if (prev !== undefined) {
       prevCwdRef.current[id] = prev;
       delete pendingPrevRef.current[id];
     }
+    const pendCd = pendingCdRef.current[id];
+    if (pendCd !== undefined && normalizePath(pendCd) === normalizePath(path)) {
+      cwdDirRef.current[id] = path;
+      lastNavCwdRef.current[id] = path;
+      delete pendingCdRef.current[id];
+    }
   }, []);
+
+  // 供 SFTP 面板查询「终端此刻所在目录」：面板打开 / 用户点同步按钮时用它定位。
+  // 用 ref 读取，避免提示符每次变化都触发 App 重渲染。
+  const getCurrentCwd = useCallback(
+    (id: string) => cwdDirRef.current[id],
+    [],
+  );
+
+  // 当前激活 SSH 标签的已知目录：作为面板打开时的初始路径（打开即刷新该目录，
+  // 而不是每次都退回 home —— 那正是「面板过一会儿跳回 /root」的来源）
+  const activeCwd = activeTab && activeTab.kind === 'ssh'
+    ? cwdDirRef.current[activeTab.id]
+    : undefined;
 
   // 渲染一个标签页的面板：cluster → 集群监控；ssh → 终端。
   // 所有标签统一放进 .term-view（absolute 定位）：
@@ -1177,6 +1208,8 @@ export default function App() {
               onNavConsumed={handleNavConsumed}
               onHomeReady={handleHomeReady}
               onPathLoaded={handlePathLoaded}
+              initialPath={activeCwd}
+              getCurrentCwd={getCurrentCwd}
             />
           </ErrorBoundary>
         )}
@@ -1200,6 +1233,11 @@ export default function App() {
           <ErrorBoundary>
             <AIPanel
               sessionId={activeTab?.kind === 'ssh' ? activeId : null}
+              host={
+                activeTab?.kind === 'ssh'
+                  ? `${activeTab.username}@${activeTab.host}`
+                  : null
+              }
               onClose={() => setAiOpen(false)}
             />
           </ErrorBoundary>

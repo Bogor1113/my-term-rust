@@ -56,10 +56,15 @@ function stripAnsi(s: string): string {
 }
 
 // ---------- 提示符解析 ----------
-// 匹配常见 bash 提示符 `user@host:path#` / `user@host:path$`（含 root 的 #）。
-// 捕获组 1 为路径部分，可含 `~`、相对段等，由 App.handleCwdChange 归一化。
-// 供「完整行解析」与「残留缓冲解析」共用，保证两处判定口径一致。
-const PROMPT_RE = /^[^\s@]+@[^:\s]+:(.*?)([#$])(?:\s.*)?$/;
+// 匹配常见 bash / zsh 提示符，捕获组 1 为路径部分：
+//   root@host:/opt/app#           root@host:/opt/app# ls
+//   [root@host ~]#                [root@host /opt/app]# ls
+//   (venv) [root@host ~]$         root@host /opt/app $
+// 旧的 `^[^\s@]+@[^:\s]+:(.*?)([#$])` 只能识别「user@host:路径」一种写法，
+// 像 [root@host ~]# 这类最常见的写法会解析失败却又被当成「提示符已可解析」，
+// 于是按键 cd 跟随被禁用，面板从此不再跟随终端目录。
+const PROMPT_RE =
+  /^(?:\([^)]*\)\s*)?\[?[^\s@[\]]+@[^\s:\]]+(?::|\s+)(.*?)\s*\]?\s*([#$%])(?:[\s\])].*)?$/;
 
 // ---------- 字体缩放（Ctrl + 滚轮） ----------
 const FONT_SIZE_KEY = 'myterm.fontSize';
@@ -434,6 +439,11 @@ const TerminalTab = memo(function TerminalTab({
       if (!m) return;
       const raw = (m[1] || '').trim();
       if (!raw) return;
+      // 只有能还原成绝对路径的提示符才作为权威 cwd。
+      // `\W` / `%~` 之外只显示目录名的提示符（如 [root@host app]#）无法还原
+      // 完整路径，若也把 promptSeen 置真，会让按键 cd 跟随被永久禁用 ——
+      // 表现为「面板完全不跟随」。
+      if (raw !== '~' && !raw.startsWith('~/') && !raw.startsWith('/')) return;
       promptSeenRef.current = true;
       onCwdChangeRef.current?.(tab.id, raw);
     },

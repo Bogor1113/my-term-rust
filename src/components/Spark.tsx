@@ -41,8 +41,8 @@ export function Spark({
   const toY = (v: number) => 19 - (Math.min(Math.max(v, 0), safeMax) / safeMax) * 17; // y: 2..19
   return (
     <svg className={className} viewBox="0 0 100 20" preserveAspectRatio="none">
-      {/* 网格：3 横 3 竖（25%/50%/75%） */}
-      <g stroke="rgba(255,255,255,0.07)" strokeWidth="1" vectorEffect="non-scaling-stroke">
+      {/* 网格：3 横 3 竖（25%/50%/75%）。用中性灰而非白色，深/浅主题都可见 */}
+      <g stroke="rgba(128, 140, 158, 0.18)" strokeWidth="1" vectorEffect="non-scaling-stroke">
         <line x1="0" y1="5" x2="100" y2="5" />
         <line x1="0" y1="10" x2="100" y2="10" />
         <line x1="0" y1="15" x2="100" y2="15" />

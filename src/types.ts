@@ -31,6 +31,7 @@ export interface DiskInfo {
 }
 
 export interface SysInfo {
+  host: string; // 远程主机地址（后端采集时附带）
   cpuPercent: number;
   cpuBrand: string;
   memTotal: number;
@@ -38,6 +39,9 @@ export interface SysInfo {
   memPercent: number;
   netRx: number; // 下行 字节/秒
   netTx: number; // 上行 字节/秒
+  uptimeSecs: number; // 系统运行时长（秒；未知为 0）
+  userCount: number; // 登录用户会话数（未知为 0）
+  topUser: string; // 会话数最多的登录用户名（空表示未知）
   disks: DiskInfo[];
 }
 
@@ -83,7 +87,82 @@ export interface AiMessage {
    * 输出的最后一条（updateLastAssistant 按"最后一条"定位）。
    */
   id: string;
+  /**
+   * Agent 模式下的工具执行轨迹。
+   *
+   * 既用于渲染命令 / 脚本卡片，也用于下一轮重建 OpenAI 协议上下文
+   * （assistant.tool_calls + role=tool 结果），这样追问时模型仍记得执行过什么。
+   */
+  rounds?: AiAgentRound[];
 }
+
+/** 模型要求调用的一次工具（OpenAI function calling 原样结构） */
+export interface AiToolCall {
+  id: string;
+  type: string;
+  function: {
+    name: string;
+    /** JSON 字符串（不是对象）：模型偶尔会给出非法 JSON，执行前必须容错 */
+    arguments: string;
+  };
+}
+
+/** 一次工具调用的执行结果 */
+export interface AiToolResult {
+  toolCallId: string;
+  name: string;
+  ok: boolean;
+  /** 用户拒绝执行 */
+  skipped?: boolean;
+  command?: string;
+  path?: string;
+  /** write_script 的脚本内容（已截断，仅用于展示 / 复制） */
+  script?: string;
+  /** 回传给模型的文本（含退出码 / stderr） */
+  output: string;
+  exitCode?: number;
+  durationMs?: number;
+}
+
+/** Agent 的一轮：模型说明 + 若干工具调用及结果 */
+export interface AiAgentRound {
+  content: string;
+  toolCalls: AiToolCall[];
+  results: AiToolResult[];
+}
+
+/** 传给 ai_chat_complete 的消息（字段名必须与 OpenAI 协议一致） */
+export interface AgentMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls?: AiToolCall[];
+  tool_call_id?: string;
+}
+
+/** Agent 一轮非流式调用的返回 */
+export interface AgentCompletion {
+  content: string;
+  toolCalls: AiToolCall[];
+  finishReason: string | null;
+}
+
+/** 远程命令执行结果 */
+export interface AgentCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  truncated: boolean;
+  durationMs: number;
+}
+
+/** 远程脚本写入结果 */
+export interface AgentWriteScriptResult {
+  path: string;
+  bytes: number;
+  mode: string;
+  exec: AgentCommandResult | null;
+}
+
 
 // 模型调用配置（OpenAI 兼容接口）
 export interface AiConfig {

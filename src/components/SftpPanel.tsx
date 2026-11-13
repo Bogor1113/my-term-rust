@@ -1,4 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { invoke } from '@tauri-apps/api/core';
+import { downloadDir as getLocalDownloadDir } from '@tauri-apps/api/path';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -26,6 +29,10 @@ interface Props {
   onHomeReady: (id: string, home: string) => void;
   /** 目录加载成功后上报（App 用它确认 cd 导航，提交 OLDPWD） */
   onPathLoaded?: (id: string, path: string) => void;
+  /** 打开面板时应定位到的目录（终端当前目录；未知时回退 home） */
+  initialPath?: string;
+  /** 查询终端此刻所在目录（面板打开时可能还没同步到 props） */
+  getCurrentCwd?: (id: string) => string | undefined;
 }
 
 interface ActiveTransfer {
@@ -51,6 +58,9 @@ const ZERO_PROGRESS: TransferProgress = {
   skipped: 0,
   conflict: null,
 };
+
+/** 拖拽下载的默认本地目录（记住用户首次的选择，之后拖出面板直接下载不再询问） */
+const DLDIR_KEY = 'myterm.downloadDir';
 
 function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -113,6 +123,7 @@ const SftpFileList = memo(function SftpFileList({
   onRename,
   onRemove,
   onContextMenu,
+  onRowPointerDown,
 }: {
   entries: SftpEntry[];
   loading: boolean;
@@ -121,13 +132,14 @@ const SftpFileList = memo(function SftpFileList({
   onRename: (e: SftpEntry) => void;
   onRemove: (e: SftpEntry) => void;
   onContextMenu: (e: React.MouseEvent, entry: SftpEntry) => void;
+  /** 行上按下鼠标：交给父级识别"拖出面板下载"手势 */
+  onRowPointerDown: (e: SftpEntry, ev: React.PointerEvent) => void;
 }) {
   return (
     <div className="sftp-list">
       <div className="sftp-list-head">
         <span>名称</span>
         <span>大小</span>
-        <span>权限</span>
       </div>
       {loading && (
         <div className="sftp-status">
@@ -144,6 +156,7 @@ const SftpFileList = memo(function SftpFileList({
             className={`sftp-row ${e.isDir ? 'dir' : ''}`}
             key={e.path}
             onDoubleClick={() => onEnter(e)}
+            onPointerDown={(ev) => onRowPointerDown(e, ev)}
             onContextMenu={(ev) => {
               ev.preventDefault();
               ev.stopPropagation();
@@ -158,7 +171,6 @@ const SftpFileList = memo(function SftpFileList({
               <span className="sftp-fname">{e.name}</span>
             </span>
             <span className="sftp-size">{e.isDir ? '—' : formatSize(e.size)}</span>
-            <span className="sftp-perms">{e.perms}</span>
             <span className="sftp-actions">
               {/* 文件夹同样提供下载入口：后端 sftp_download 已支持整目录递归下载，
                   此前仅靠右键菜单暴露，行内无按钮导致用户以为不支持下载文件夹 */}
@@ -196,8 +208,11 @@ export default function SftpPanel({
   onNavConsumed,
   onHomeReady,
   onPathLoaded,
+  initialPath,
+  getCurrentCwd,
 }: Props) {
-  const [path, setPath] = useState('/');
+  // 首帧就显示已知的终端目录，避免先闪一下 "/" / home 再跳走
+  const [path, setPath] = useState(initialPath || '/');
   const [entries, setEntries] = useState<SftpEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -205,6 +220,31 @@ export default function SftpPanel({
   const [pathInput, setPathInput] = useState('');
   const [transfers, setTransfers] = useState<ActiveTransfer[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  // 拖拽下载（拖出面板 → 下载到默认本地目录）：跟随光标的幽灵提示
+  const [rowDrag, setRowDrag] = useState<{
+    entry: SftpEntry;
+    x: number;
+    y: number;
+    outside: boolean;
+  } | null>(null);
+  // 拖拽手势识别（ref 持有，避免高频 move 触发重渲染）
+  const rowDragRef = useRef<{
+    entry: SftpEntry;
+    startX: number;
+    startY: number;
+    active: boolean;
+    /** 鼠标是否仍按住（松手置 false，用于决定下载完成后是否接管为原生拖拽） */
+    held: boolean;
+    cleanup?: () => void;
+  } | null>(null);
+  // 默认下载目录（展示用；实际读取在 dragDownload 中以 ref 数据为准）
+  const [dlDir, setDlDir] = useState<string>(() => {
+    try {
+      return localStorage.getItem(DLDIR_KEY) ?? '';
+    } catch {
+      return '';
+    }
+  });
   // 传输同名冲突队列（逐个弹出处理，避免并发冲突互相覆盖）
   const [conflictQueue, setConflictQueue] = useState<
     { requestId: string; name: string; path: string }[]
@@ -235,17 +275,25 @@ export default function SftpPanel({
   const panelRef = useRef<HTMLDivElement>(null);
   const pathRef = useRef<string>('/');
   const transfersRef = useRef<ActiveTransfer[]>([]);
+  // 打开时的目标目录（渲染期同步，供挂载 / 切换标签时读取最新值）
+  const initialPathRef = useRef<string | undefined>(initialPath);
+  initialPathRef.current = initialPath;
+  // 当前渲染帧的导航请求（供挂载 effect 读取，但不作为依赖）
+  const navReqRef = useRef(navReq);
+  navReqRef.current = navReq;
   // 稳定回调 ref：供 SftpFileList 的 memo 比较使用，避免每 100ms 进度事件导致文件列表重渲染
   const handlersRef = useRef<{
     enter: (e: SftpEntry) => void;
     download: (e: SftpEntry) => void;
     rename: (e: SftpEntry) => void;
     remove: (e: SftpEntry) => void;
+    rowPointerDown: (e: SftpEntry, ev: React.PointerEvent) => void;
   }>({
     enter: () => {},
     download: () => {},
     rename: () => {},
     remove: () => {},
+    rowPointerDown: () => {},
   });
   // 加载序号：只允许最新一次请求更新界面（防止旧请求覆盖新结果）
   const loadSeqRef = useRef(0);
@@ -297,28 +345,43 @@ export default function SftpPanel({
     // 清空上一台主机的目录视图：面板随 activeTab 复用不重挂载，
     // 不重置的话用户会先看到上一台服务器的目录，等新 load() 返回才跳走。
     setEntries([]);
-    setPath('/');
+    // 路径直接落位到新标签的已知终端目录，避免闪一下 "/" 再跳
+    setPath(initialPathRef.current || '/');
     setError('');
   }, [tab.id]);
 
-  // 初次挂载：获取 home 并上报；若无待处理的 cd 导航则进入 home
+  // 打开面板 / 切换标签：定位到「终端当前目录」并重新拉取列表（相当于自动刷新），
+  // 只有拿不到终端目录时才回退 home。
+  // 此前无条件加载 home，面板每次重开都会把已经跟随到的目录拽回 /root；而
+  // 提示符导航有「cwd 未变化就不重复导航」的去重，导致它再也回不到真实目录。
   useEffect(() => {
     let cancelled = false;
+    // 挂载当帧的 cd 导航请求由下方独立 effect 处理，这里不重复加载
+    const pendingNav = navReqRef.current;
+    const tracked = pendingNav?.path ?? getCurrentCwd?.(tab.id) ?? initialPathRef.current;
+
+    // home 仍然要拉一次：`~` / 相对路径解析、cd 同步都依赖它。
+    // 但只用它做兜底，绝不用来覆盖已知的终端目录。
     void sftpHome(tab.id)
       .then((home) => {
         if (cancelled) return;
         onHomeReady(tab.id, home);
-        // 已发生 cd 导航时不加载 home，避免覆盖目标目录
-        if (!navLoadedRef.current) {
+        if (!pendingNav && !tracked && !navLoadedRef.current) {
           void load(home);
         }
       })
       .catch((e) => {
-        if (!cancelled && !navLoadedRef.current) setError(String(e));
+        if (cancelled || pendingNav || tracked || navLoadedRef.current) return;
+        setError(String(e));
       });
+
+    if (tracked && !pendingNav) void load(tracked);
     return () => {
       cancelled = true;
     };
+    // navReq 故意不进依赖：它被消费后变成 null 会再跑一次本 effect，
+    // 用旧的 cwd 覆盖正在加载的 cd 目标（这正是面板乱跳的成因之一）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab.id, load, onHomeReady]);
 
   // 终端 cd 同步导航（一次性请求，消费后通知 App 清除）
@@ -415,6 +478,16 @@ export default function SftpPanel({
 
   const refresh = () => void load(path);
 
+  // 手动跟随：立即定位到终端此刻所在目录（提示符无法解析时的兜底入口）
+  const syncToCwd = () => {
+    const p = getCurrentCwd?.(tab.id) ?? initialPathRef.current;
+    if (!p) {
+      setError('暂未获取到终端当前目录，请先在终端里执行一次命令');
+      return;
+    }
+    void load(p);
+  };
+
   const mkdir = () => {
     setPrompt({
       title: '新建文件夹',
@@ -442,6 +515,16 @@ export default function SftpPanel({
 
   // 正在传输的 key 集合：防止同一传输项被并发重复启动（如快速连点重试）
   const runningKeysRef = useRef<Set<string>>(new Set());
+
+  // "已完成"提示的自动消失定时器：完成 5 秒后自动移除该传输项
+  const dismissTimersRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const timers = dismissTimersRef.current;
+    return () => {
+      timers.forEach((t) => window.clearTimeout(t));
+      timers.clear();
+    };
+  }, []);
 
   const runTransfer = useCallback(
     async (
@@ -518,21 +601,22 @@ export default function SftpPanel({
       } finally {
         runningKeysRef.current.delete(key);
         if (ok && aliveRef.current !== false) {
-          if (type === 'download') {
-            // 下载完成：保留传输项显示"已完成"，可打开所在文件夹 / 移除
-            setT((ts) =>
-              ts.map((t) =>
-                t.key === key
-                  ? { ...t, status: 'done', progress: { ...t.progress, percent: 100 } }
-                  : t,
-              ),
-            );
-          } else {
-            // 上传成功：移除传输项并刷新目标目录
-            setT((ts) => ts.filter((t) => t.key !== key));
+          // 完成：显示"已完成"提示 5 秒后自动消失（失败项不自动消失，留着重试）
+          setT((ts) =>
+            ts.map((t) =>
+              t.key === key ? { ...t, status: 'done', progress: { ...t.progress, percent: 100 } } : t,
+            ),
+          );
+          if (type === 'upload') {
+            // 上传完成：刷新目标目录（传输项由 5 秒定时器移除）
             const idx = remotePath.lastIndexOf('/');
             void load(idx > 0 ? remotePath.substring(0, idx) : '/');
           }
+          const timer = window.setTimeout(() => {
+            dismissTimersRef.current.delete(key);
+            setT((ts) => ts.filter((t) => t.key !== key));
+          }, 5000);
+          dismissTimersRef.current.set(key, timer);
         }
       }
     },
@@ -667,6 +751,146 @@ export default function SftpPanel({
     await runDownload(entry, dest);
   };
 
+  // ---------- 拖拽下载（拖出面板） ----------
+  //
+  // 流程：手势激活（位移 >8px）→ 先经 SFTP 下载到本地下载目录；
+  // 下载完成时若鼠标仍按住 → 调用 Rust `drag_out_files` 启动系统原生拖拽
+  // （DoDragDrop），此后拖到桌面/资源管理器任意目录松手即复制到那里。
+  // 若中途松手，下载照常完成（等同"下载到默认目录"），不启动原生拖拽。
+
+  // 修改默认下载目录（drop 提示行上的目录名可点击）
+  const chooseDlDir = async () => {
+    const picked = await runDialog(() =>
+      open({
+        directory: true,
+        recursive: true,
+        title: '选择默认下载目录（拖拽下载将保存到此目录）',
+      }),
+    );
+    if (!picked) return;
+    const dir = (Array.isArray(picked) ? picked[0] : picked) || '';
+    if (!dir) return;
+    try {
+      localStorage.setItem(DLDIR_KEY, dir);
+    } catch {
+      /* 存储失败时仅本次会话生效 */
+    }
+    setDlDir(dir);
+  };
+
+  // 拖拽目标目录：用户设置的默认目录，未设置则回退系统"下载"目录
+  const resolveDragTargetDir = async (): Promise<string> => {
+    if (dlDir) return dlDir;
+    try {
+      return (await getLocalDownloadDir()) || '';
+    } catch {
+      return '';
+    }
+  };
+
+  // 手势激活时启动：下载到目标目录，完成后视鼠标状态接管为原生拖拽
+  const startGestureDownload = async (
+    st: {
+      entry: SftpEntry;
+      held: boolean;
+      cleanup?: () => void;
+    },
+  ) => {
+    const dir = await resolveDragTargetDir();
+    if (!dir) return;
+    const target =
+      dir.endsWith('/') || dir.endsWith('\\')
+        ? dir + st.entry.name
+        : dir + '/' + st.entry.name;
+    try {
+      await runDownload(st.entry, target);
+    } catch {
+      return; // runDownload 已把失败状态写进传输列表
+    }
+    // 下载完成且鼠标仍未松开 → 启动系统原生拖拽：拖到桌面/任意文件夹松手即复制
+    if (st.held) {
+      setRowDrag(null); // 原生拖拽期间由系统接管，收掉幽灵提示
+      try {
+        await invoke('drag_out_files', { paths: [target] });
+      } catch {
+        // 取消或失败静默：文件本身已在下载目录，不算错误
+      } finally {
+        // 原生拖拽吞掉了 pointerup，旧手势的监听器必须在这里清掉
+        st.cleanup?.();
+      }
+    }
+  };
+
+  // 光标是否在 SFTP 面板内（决定幽灵提示是否显示"拖到桌面/文件夹"）
+  const inPanel = (x: number, y: number): boolean => {
+    const el = panelRef.current;
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+
+  // 行上按下鼠标：位移超过阈值即进入拖拽手势（双击进入目录 / 右键菜单不受影响）。
+  // setPointerCapture 保证拖到窗口外仍能收到 move / up 事件。
+  const beginRowPointerDown = useCallback(
+    (entry: SftpEntry, ev: React.PointerEvent) => {
+      if (ev.button !== 0) return;
+      if ((ev.target as HTMLElement).closest('button, select, input, textarea')) return;
+      const st: {
+        entry: SftpEntry;
+        startX: number;
+        startY: number;
+        active: boolean;
+        held: boolean;
+        cleanup?: () => void;
+      } = {
+        entry,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        active: false,
+        held: true,
+      };
+      rowDragRef.current = st;
+      // 注意：这里不能 setPointerCapture —— 它会让 Chromium 在 Win32 层
+      // 抢占鼠标捕获，与后续 OLE 原生拖拽（DoDragDrop）的捕获互相打架，
+      // 导致原生拖拽几步之后失联。不捕获时窗口内的 move 依旧可用，
+      // 原生拖拽一旦启动，鼠标事件由 OLE 接管。
+      const cleanup = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', finish);
+        window.removeEventListener('pointercancel', finish);
+        st.held = false;
+        if (rowDragRef.current === st) rowDragRef.current = null;
+        setRowDrag(null);
+      };
+      // 原生拖拽结束后 pointerup 不会回到页面（被 OLE 吞掉），
+      // 必须在这里主动清理，否则残留的 move 监听会污染下一次手势
+      st.cleanup = cleanup;
+      const move = (e: PointerEvent) => {
+        const cur = rowDragRef.current;
+        if (!cur) return;
+        if (!cur.active) {
+          if (Math.hypot(e.clientX - st.startX, e.clientY - st.startY) < 8) return;
+          cur.active = true;
+          void startGestureDownload(cur);
+        }
+        setRowDrag({
+          entry: cur.entry,
+          x: e.clientX,
+          y: e.clientY,
+          outside: !inPanel(e.clientX, e.clientY),
+        });
+      };
+      const finish = () => {
+        cleanup();
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', finish);
+      window.addEventListener('pointercancel', finish);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dlDir, runDownload],
+  );
+
   const rename = (entry: SftpEntry) => {
     setPrompt({
       title: '重命名',
@@ -738,6 +962,7 @@ export default function SftpPanel({
     download,
     rename,
     remove,
+    rowPointerDown: beginRowPointerDown,
   };
   // 稳定回调包装器：引用不变，内部委托给 handlersRef.current，
   // 使 SftpFileList 的 memo 能在 entries 不变时跳过重渲染
@@ -745,6 +970,11 @@ export default function SftpPanel({
   const stableDownload = useCallback((e: SftpEntry) => handlersRef.current.download(e), []);
   const stableRename = useCallback((e: SftpEntry) => handlersRef.current.rename(e), []);
   const stableRemove = useCallback((e: SftpEntry) => handlersRef.current.remove(e), []);
+  const stableRowPointerDown = useCallback(
+    (e: SftpEntry, ev: React.PointerEvent) =>
+      handlersRef.current.rowPointerDown(e, ev),
+    [],
+  );
   const stableCtxMenu = useCallback(
     (ev: React.MouseEvent, entry: SftpEntry) => {
       ev.preventDefault();
@@ -810,6 +1040,13 @@ export default function SftpPanel({
             {path}
           </div>
         )}
+        <button className="icon-btn" title="定位到终端当前目录" onClick={syncToCwd}>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="7" />
+            <circle cx="12" cy="12" r="2.2" />
+            <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+          </svg>
+        </button>
         <button className="icon-btn" title="刷新" onClick={refresh}>
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6" />
@@ -818,13 +1055,6 @@ export default function SftpPanel({
       </div>
 
       <div className="sftp-tools">
-        <button className="sftp-tool" onClick={mkdir}>
-          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
-            <path d="M12 11v5M9.5 13.5h5" />
-          </svg>
-          新建文件夹
-        </button>
         <button className="sftp-tool primary" onClick={() => void uploadDialog()}>
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
             <path d="M12 16V4M7 9l5-5 5 5" />
@@ -841,7 +1071,16 @@ export default function SftpPanel({
         </button>
       </div>
 
-      <div className="sftp-drop-hint">将本地文件/文件夹拖入面板即可上传</div>
+      <div className="sftp-drop-hint">
+        拖出面板 = 下载 · 按住不松手可直接拖到桌面/任意文件夹 · 文件拖入上传
+        <span
+          className="sftp-dl-dir"
+          title={dlDir || '未设置：使用系统下载目录'}
+          onClick={() => void chooseDlDir()}
+        >
+          {dlDir ? ` → ${dlDir}` : '（下载目录：系统下载）'}
+        </span>
+      </div>
 
       <SftpFileList
         entries={entries}
@@ -851,6 +1090,7 @@ export default function SftpPanel({
         onRename={stableRename}
         onRemove={stableRemove}
         onContextMenu={stableCtxMenu}
+        onRowPointerDown={stableRowPointerDown}
       />
 
       {/* 传输进度（失败时保留，显示错误并可重试/移除；下载完成后保留，可打开所在文件夹） */}
@@ -932,6 +1172,34 @@ export default function SftpPanel({
           ))}
         </div>
       )}
+
+      {/* 拖拽下载幽灵提示：portal 渲染到 body（面板有 backdrop-filter，
+          fixed 定位子元素会被其裁剪），拖出面板后依然可见 */}
+      {rowDrag &&
+        createPortal(
+          <>
+            {rowDrag.outside && (
+              <div
+                className="sftp-drag-hint"
+                style={{ left: rowDrag.x + 14, top: rowDrag.y + 20 }}
+              >
+                {rowDrag.entry.isDir ? '整个文件夹' : '文件'}下载中…
+                完成前保持按住，完成后可拖到桌面/任意文件夹松手
+              </div>
+            )}
+            <div
+              className="sftp-drag-ghost"
+              style={{ left: rowDrag.x + 10, top: rowDrag.y + 8 }}
+            >
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 4v12M7 11l5 5 5-5" />
+                <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+              </svg>
+              {rowDrag.entry.name}
+            </div>
+          </>,
+          document.body,
+        )}
 
       {/* 拖拽上传叠层 */}
       {dragOver && (

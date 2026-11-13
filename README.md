@@ -43,13 +43,18 @@
 | YARN 面板 | 应用列表（含运行状态）、在线节点、集群指标，支持 Kill 应用 |
 | JVM 指标 | NameNode JVM 堆内存 / GC / 线程等运行时数据 |
 
-### AI 助手
+### AI 助手 / Agent
 
 内置 AI 对话面板，可在终端旁边直接问问题（比如"这条报错什么意思"）。
 
 - 走 **OpenAI 兼容接口**，DeepSeek / Qwen / 通义 / GLM 等主流服务都能接
 - 只需配置 `BaseURL` + `API Key` + 模型名
 - 请求由 **Rust 后端发出**，绕开浏览器 CORS 限制，且 **API Key 不会打进前端产物**
+- **Agent 模式**（需要模型支持 function calling）：AI 可在当前 SSH 会话里
+  - 自动执行非交互式命令，读取 stdout / stderr / 退出码，再根据结果继续排查；
+  - 把完整 shell 脚本写到服务器（自动建目录、`chmod 755`，可选立即执行）；
+  - 支持「自动执行」与「执行前逐条确认」两种模式；`rm -rf /`、`mkfs`、`dd` 写盘、
+    关机重启等高危命令始终由后端拦截。
 
 ### 界面
 
@@ -110,7 +115,8 @@ my-term-rust/
 │       ├── sftp.rs               # 文件浏览与传输
 │       ├── system.rs             # 远程资源采集
 │       ├── cluster.rs            # Hadoop 集群监控
-│       └── ai.rs                 # AI 流式对话
+│       ├── ai.rs                 # AI 流式对话 / Agent 一轮调用
+│       └── agent.rs              # Agent 工具定义与远程命令 / 脚本执行
 ├── scripts/                      # 构建辅助脚本
 ├── bump-version.mjs              # 版本号统一提升
 ├── 一键打包.bat                   # Windows 一键出包
